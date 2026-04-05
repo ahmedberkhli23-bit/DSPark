@@ -1,0 +1,544 @@
+// DSPark — Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi — MIT License
+
+#pragma once
+
+/**
+ * @file Biquad.h
+ * @brief Biquad filter with Transposed Direct Form II and Audio EQ Cookbook coefficients.
+ *
+ * Provides two classes:
+ *
+ * - **BiquadCoeffs<T>**: Coefficient set with static factory methods for all
+ *   standard filter types (low-pass, high-pass, band-pass, peak, low-shelf,
+ *   high-shelf, notch, all-pass). Formulas from Robert Bristow-Johnson's
+ *   "Audio EQ Cookbook" — the industry standard reference.
+ *
+ * - **Biquad<T, MaxChannels>**: Per-channel filter state using Transposed Direct
+ *   Form II (TDF-II), the preferred structure for floating-point due to superior
+ *   numerical stability and lower noise floor compared to Direct Form I/II.
+ *
+ * Dependencies: C++20 standard library only (<array>, <cmath>, <numbers>).
+ *
+ * @note All coefficient computations use double-precision internally for accuracy,
+ *       then convert to the target type T. This prevents coefficient quantisation
+ *       artefacts when T is float.
+ *
+ * @code
+ *   // Create a peak filter at 1 kHz, Q=1.5, +6 dB boost
+ *   auto coeffs = dspark::BiquadCoeffs<float>::makePeak(48000.0, 1000.0, 1.5, 6.0);
+ *
+ *   // Apply to stereo audio
+ *   dspark::Biquad<float, 2> filter;
+ *   filter.setCoeffs(coeffs);
+ *
+ *   for (int i = 0; i < numSamples; ++i) {
+ *       leftOut[i]  = filter.processSample(leftIn[i], 0);
+ *       rightOut[i] = filter.processSample(rightIn[i], 1);
+ *   }
+ * @endcode
+ */
+
+#include <array>
+#include <cmath>
+#include <numbers>
+
+#include "AudioBuffer.h"
+#include "DenormalGuard.h"
+
+namespace dspark {
+
+// ============================================================================
+// BiquadCoeffs — Coefficient storage + factory methods
+// ============================================================================
+
+/**
+ * @struct BiquadCoeffs
+ * @brief Stores normalised biquad coefficients (b0, b1, b2, a1, a2).
+ *
+ * Coefficients are pre-normalised by a0 in every factory method, so the
+ * filter processing loop never needs to divide by a0.
+ *
+ * @tparam T Coefficient type (float or double).
+ */
+template <typename T>
+struct BiquadCoeffs
+{
+    T b0 = T(1), b1 = T(0), b2 = T(0);
+    T a1 = T(0), a2 = T(0);
+
+    // -- Factory methods (Audio EQ Cookbook) ----------------------------------
+
+    /**
+     * @brief Low-pass filter.
+     * @param sampleRate Sample rate in Hz.
+     * @param freq       Centre frequency in Hz.
+     * @param Q          Quality factor (default: 1/sqrt(2) = Butterworth).
+     */
+    [[nodiscard]] static BiquadCoeffs makeLowPass(double sampleRate, double freq, double Q = 0.7071067811865476) noexcept
+    {
+        freq = std::clamp(freq, 1.0, sampleRate * 0.499);
+        Q = std::max(Q, 0.001);
+        const double w0    = 2.0 * std::numbers::pi * freq / sampleRate;
+        const double cosw0 = std::cos(w0);
+        const double sinw0 = std::sin(w0);
+        const double alpha = sinw0 / (2.0 * Q);
+
+        const double a0 = 1.0 + alpha;
+        return normalise(a0, {
+            T((1.0 - cosw0) / 2.0),
+            T( 1.0 - cosw0),
+            T((1.0 - cosw0) / 2.0),
+            T(-2.0 * cosw0),
+            T( 1.0 - alpha)
+        });
+    }
+
+    /**
+     * @brief High-pass filter.
+     * @param sampleRate Sample rate in Hz.
+     * @param freq       Centre frequency in Hz.
+     * @param Q          Quality factor (default: Butterworth).
+     */
+    [[nodiscard]] static BiquadCoeffs makeHighPass(double sampleRate, double freq, double Q = 0.7071067811865476) noexcept
+    {
+        freq = std::clamp(freq, 1.0, sampleRate * 0.499);
+        Q = std::max(Q, 0.001);
+        const double w0    = 2.0 * std::numbers::pi * freq / sampleRate;
+        const double cosw0 = std::cos(w0);
+        const double sinw0 = std::sin(w0);
+        const double alpha = sinw0 / (2.0 * Q);
+
+        const double a0 = 1.0 + alpha;
+        return normalise(a0, {
+            T( (1.0 + cosw0) / 2.0),
+            T(-(1.0 + cosw0)),
+            T( (1.0 + cosw0) / 2.0),
+            T(-2.0 * cosw0),
+            T( 1.0 - alpha)
+        });
+    }
+
+    /**
+     * @brief Band-pass filter (constant skirt gain, peak gain = Q).
+     * @param sampleRate Sample rate in Hz.
+     * @param freq       Centre frequency in Hz.
+     * @param Q          Quality factor (default: Butterworth).
+     */
+    [[nodiscard]] static BiquadCoeffs makeBandPass(double sampleRate, double freq, double Q = 0.7071067811865476) noexcept
+    {
+        freq = std::clamp(freq, 1.0, sampleRate * 0.499);
+        Q = std::max(Q, 0.001);
+        const double w0    = 2.0 * std::numbers::pi * freq / sampleRate;
+        const double cosw0 = std::cos(w0);
+        const double sinw0 = std::sin(w0);
+        const double alpha = sinw0 / (2.0 * Q);
+
+        const double a0 = 1.0 + alpha;
+        return normalise(a0, {
+            T(alpha),
+            T(0.0),
+            T(-alpha),
+            T(-2.0 * cosw0),
+            T( 1.0 - alpha)
+        });
+    }
+
+    /**
+     * @brief Peak (parametric EQ) filter.
+     *
+     * Uses the correct Audio EQ Cookbook formula where A = 10^(dBgain/40),
+     * giving the expected gain in dB at the centre frequency.
+     *
+     * @param sampleRate Sample rate in Hz.
+     * @param freq       Centre frequency in Hz.
+     * @param Q          Quality factor.
+     * @param gainDb     Gain in decibels (positive = boost, negative = cut).
+     */
+    [[nodiscard]] static BiquadCoeffs makePeak(double sampleRate, double freq, double Q, double gainDb) noexcept
+    {
+        freq = std::clamp(freq, 1.0, sampleRate * 0.499);
+        Q = std::max(Q, 0.001);
+        const double A     = std::pow(10.0, gainDb / 40.0); // dB/40 = sqrt of linear gain
+        const double w0    = 2.0 * std::numbers::pi * freq / sampleRate;
+        const double cosw0 = std::cos(w0);
+        const double sinw0 = std::sin(w0);
+        const double alpha = sinw0 / (2.0 * Q);
+
+        const double a0 = 1.0 + alpha / A;
+        return normalise(a0, {
+            T(1.0 + alpha * A),
+            T(-2.0 * cosw0),
+            T(1.0 - alpha * A),
+            T(-2.0 * cosw0),
+            T(1.0 - alpha / A)
+        });
+    }
+
+    /**
+     * @brief Low-shelf filter.
+     * @param sampleRate Sample rate in Hz.
+     * @param freq       Transition frequency in Hz.
+     * @param gainDb     Shelf gain in decibels.
+     * @param slope      Shelf slope (default: 1.0 for standard 6 dB/oct transition).
+     */
+    [[nodiscard]] static BiquadCoeffs makeLowShelf(double sampleRate, double freq, double gainDb, double slope = 1.0) noexcept
+    {
+        freq = std::clamp(freq, 1.0, sampleRate * 0.499);
+        const double A     = std::pow(10.0, gainDb / 40.0);
+        const double w0    = 2.0 * std::numbers::pi * freq / sampleRate;
+        const double cosw0 = std::cos(w0);
+        const double sinw0 = std::sin(w0);
+        const double alpha = sinw0 / 2.0 * std::sqrt((A + 1.0 / A) * (1.0 / slope - 1.0) + 2.0);
+        const double twoSqrtAAlpha = 2.0 * std::sqrt(A) * alpha;
+
+        const double a0 = (A + 1.0) + (A - 1.0) * cosw0 + twoSqrtAAlpha;
+        return normalise(a0, {
+            T(A * ((A + 1.0) - (A - 1.0) * cosw0 + twoSqrtAAlpha)),
+            T(2.0 * A * ((A - 1.0) - (A + 1.0) * cosw0)),
+            T(A * ((A + 1.0) - (A - 1.0) * cosw0 - twoSqrtAAlpha)),
+            T(-2.0 * ((A - 1.0) + (A + 1.0) * cosw0)),
+            T((A + 1.0) + (A - 1.0) * cosw0 - twoSqrtAAlpha)
+        });
+    }
+
+    /**
+     * @brief High-shelf filter.
+     * @param sampleRate Sample rate in Hz.
+     * @param freq       Transition frequency in Hz.
+     * @param gainDb     Shelf gain in decibels.
+     * @param slope      Shelf slope (default: 1.0).
+     */
+    [[nodiscard]] static BiquadCoeffs makeHighShelf(double sampleRate, double freq, double gainDb, double slope = 1.0) noexcept
+    {
+        freq = std::clamp(freq, 1.0, sampleRate * 0.499);
+        const double A     = std::pow(10.0, gainDb / 40.0);
+        const double w0    = 2.0 * std::numbers::pi * freq / sampleRate;
+        const double cosw0 = std::cos(w0);
+        const double sinw0 = std::sin(w0);
+        const double alpha = sinw0 / 2.0 * std::sqrt((A + 1.0 / A) * (1.0 / slope - 1.0) + 2.0);
+        const double twoSqrtAAlpha = 2.0 * std::sqrt(A) * alpha;
+
+        const double a0 = (A + 1.0) - (A - 1.0) * cosw0 + twoSqrtAAlpha;
+        return normalise(a0, {
+            T(A * ((A + 1.0) + (A - 1.0) * cosw0 + twoSqrtAAlpha)),
+            T(-2.0 * A * ((A - 1.0) + (A + 1.0) * cosw0)),
+            T(A * ((A + 1.0) + (A - 1.0) * cosw0 - twoSqrtAAlpha)),
+            T(2.0 * ((A - 1.0) - (A + 1.0) * cosw0)),
+            T((A + 1.0) - (A - 1.0) * cosw0 - twoSqrtAAlpha)
+        });
+    }
+
+    /**
+     * @brief Notch (band-reject) filter.
+     * @param sampleRate Sample rate in Hz.
+     * @param freq       Centre frequency in Hz.
+     * @param Q          Quality factor (default: Butterworth).
+     */
+    [[nodiscard]] static BiquadCoeffs makeNotch(double sampleRate, double freq, double Q = 0.7071067811865476) noexcept
+    {
+        freq = std::clamp(freq, 1.0, sampleRate * 0.499);
+        Q = std::max(Q, 0.001);
+        const double w0    = 2.0 * std::numbers::pi * freq / sampleRate;
+        const double cosw0 = std::cos(w0);
+        const double sinw0 = std::sin(w0);
+        const double alpha = sinw0 / (2.0 * Q);
+
+        const double a0 = 1.0 + alpha;
+        return normalise(a0, {
+            T(1.0),
+            T(-2.0 * cosw0),
+            T(1.0),
+            T(-2.0 * cosw0),
+            T(1.0 - alpha)
+        });
+    }
+
+    /**
+     * @brief All-pass filter.
+     * @param sampleRate Sample rate in Hz.
+     * @param freq       Centre frequency in Hz.
+     * @param Q          Quality factor (default: Butterworth).
+     */
+    [[nodiscard]] static BiquadCoeffs makeAllPass(double sampleRate, double freq, double Q = 0.7071067811865476) noexcept
+    {
+        freq = std::clamp(freq, 1.0, sampleRate * 0.499);
+        Q = std::max(Q, 0.001);
+        const double w0    = 2.0 * std::numbers::pi * freq / sampleRate;
+        const double cosw0 = std::cos(w0);
+        const double sinw0 = std::sin(w0);
+        const double alpha = sinw0 / (2.0 * Q);
+
+        const double a0 = 1.0 + alpha;
+        return normalise(a0, {
+            T(1.0 - alpha),
+            T(-2.0 * cosw0),
+            T(1.0 + alpha),
+            T(-2.0 * cosw0),
+            T(1.0 - alpha)
+        });
+    }
+
+    /**
+     * @brief Creates a DC-blocking high-pass filter.
+     *
+     * A very low frequency high-pass (default 5 Hz) used to remove DC offset
+     * introduced by nonlinear processing (saturation, waveshaping, etc.).
+     *
+     * @param sampleRate Sample rate in Hz.
+     * @param freq       Cut-off frequency in Hz (default: 5 Hz).
+     */
+    [[nodiscard]] static BiquadCoeffs makeDcBlocker(double sampleRate, double freq = 5.0) noexcept
+    {
+        freq = std::clamp(freq, 1.0, sampleRate * 0.499);
+        return makeHighPass(sampleRate, freq, 0.7071067811865476);
+    }
+
+    // -- First-order filter factory methods ------------------------------------
+
+    /**
+     * @brief First-order (6 dB/oct) low-pass filter.
+     *
+     * Uses bilinear-transformed RC filter. Coefficients are already normalised
+     * (a0 = 1 implicit), so no normalise() call is needed.
+     *
+     * @param sampleRate Sample rate in Hz.
+     * @param frequency  Cut-off frequency in Hz.
+     */
+    [[nodiscard]] static BiquadCoeffs makeFirstOrderLowPass(double sampleRate, double frequency) noexcept
+    {
+        frequency = std::clamp(frequency, 1.0, sampleRate * 0.499);
+        double w = std::tan(std::numbers::pi * frequency / sampleRate);
+        double n = 1.0 / (1.0 + w);
+        BiquadCoeffs c;
+        c.b0 = static_cast<T>(w * n);
+        c.b1 = static_cast<T>(w * n);
+        c.b2 = T(0);
+        c.a1 = static_cast<T>((w - 1.0) * n);
+        c.a2 = T(0);
+        return c;
+    }
+
+    /**
+     * @brief First-order (6 dB/oct) high-pass filter.
+     *
+     * Uses bilinear-transformed CR filter. Coefficients are already normalised
+     * (a0 = 1 implicit), so no normalise() call is needed.
+     *
+     * @param sampleRate Sample rate in Hz.
+     * @param frequency  Cut-off frequency in Hz.
+     */
+    [[nodiscard]] static BiquadCoeffs makeFirstOrderHighPass(double sampleRate, double frequency) noexcept
+    {
+        frequency = std::clamp(frequency, 1.0, sampleRate * 0.499);
+        double w = std::tan(std::numbers::pi * frequency / sampleRate);
+        double n = 1.0 / (1.0 + w);
+        BiquadCoeffs c;
+        c.b0 = static_cast<T>(n);
+        c.b1 = static_cast<T>(-n);
+        c.b2 = T(0);
+        c.a1 = static_cast<T>((w - 1.0) * n);
+        c.a2 = T(0);
+        return c;
+    }
+
+    /**
+     * @brief Creates a first-order tilt filter.
+     *
+     * Tilts the spectrum around a pivot frequency: +gainDb above the pivot,
+     * -gainDb below. A single-knob tonal balance control found in mastering
+     * EQs and channel strips (SSL, Neve, Tonelux Tilt).
+     *
+     * @param sampleRate Sample rate in Hz.
+     * @param pivotFreq  Pivot frequency in Hz (typically 600–3000 Hz).
+     * @param gainDb     Tilt amount in dB (positive = bright, negative = dark).
+     */
+    [[nodiscard]] static BiquadCoeffs makeTilt(double sampleRate, double pivotFreq, double gainDb) noexcept
+    {
+        pivotFreq = std::clamp(pivotFreq, 1.0, sampleRate * 0.499);
+        double g = std::pow(10.0, gainDb / 20.0);
+        double sqrtG = std::sqrt(g);
+        double c = std::tan(std::numbers::pi * pivotFreq / sampleRate);
+
+        // First-order tilt shelf via bilinear transform:
+        //   DC gain = 1/sqrt(g), pivot gain = 1, Nyquist gain = sqrt(g)
+        //   Total swing = gainDb (half below pivot, half above).
+        double norm = 1.0 / (1.0 + sqrtG * c);
+
+        BiquadCoeffs coeffs;
+        coeffs.b0 = static_cast<T>((sqrtG + c) * norm);
+        coeffs.b1 = static_cast<T>((c - sqrtG) * norm);
+        coeffs.b2 = T(0);
+        coeffs.a1 = static_cast<T>((sqrtG * c - 1.0) * norm);
+        coeffs.a2 = T(0);
+        return coeffs;
+    }
+
+    // -- Frequency response analysis -------------------------------------------
+
+    /**
+     * @brief Returns the magnitude response |H(f)| at a single frequency.
+     *
+     * Evaluates the transfer function H(z) = B(z)/A(z) at z = e^(j*2*pi*f/fs).
+     * Essential for drawing EQ curves and filter response plots.
+     *
+     * @param frequency  Frequency to evaluate in Hz.
+     * @param sampleRate Sample rate in Hz.
+     * @return Magnitude (linear scale, 1.0 = unity gain).
+     */
+    [[nodiscard]] T getMagnitude(double frequency, double sampleRate) const noexcept
+    {
+        double w = 2.0 * std::numbers::pi * frequency / sampleRate;
+        double cosW  = std::cos(w);
+        double cos2W = std::cos(2.0 * w);
+        double sinW  = std::sin(w);
+        double sin2W = std::sin(2.0 * w);
+
+        double nRe = static_cast<double>(b0) + static_cast<double>(b1) * cosW + static_cast<double>(b2) * cos2W;
+        double nIm = -static_cast<double>(b1) * sinW - static_cast<double>(b2) * sin2W;
+        double dRe = 1.0 + static_cast<double>(a1) * cosW + static_cast<double>(a2) * cos2W;
+        double dIm = -static_cast<double>(a1) * sinW - static_cast<double>(a2) * sin2W;
+
+        double numMag2 = nRe * nRe + nIm * nIm;
+        double denMag2 = dRe * dRe + dIm * dIm;
+
+        return (denMag2 > 1e-30)
+            ? static_cast<T>(std::sqrt(numMag2 / denMag2))
+            : T(0);
+    }
+
+    /**
+     * @brief Fills an array with magnitude responses at multiple frequencies.
+     *
+     * Efficient batch evaluation for drawing frequency response curves.
+     *
+     * @param frequencies  Array of frequencies in Hz.
+     * @param magnitudes   Output array (same size as frequencies).
+     * @param numPoints    Number of points to evaluate.
+     * @param sampleRate   Sample rate in Hz.
+     */
+    void getMagnitudeForFrequencyArray(const T* frequencies, T* magnitudes,
+                                       int numPoints, double sampleRate) const noexcept
+    {
+        for (int i = 0; i < numPoints; ++i)
+            magnitudes[i] = getMagnitude(static_cast<double>(frequencies[i]), sampleRate);
+    }
+
+private:
+    /** @brief Normalises all coefficients by a0 (divides b* and a* by a0).
+     *  Division is performed in double precision to avoid premature truncation
+     *  when T is float — coefficients are only cast to T after the division. */
+    [[nodiscard]] static BiquadCoeffs normalise(double a0, BiquadCoeffs raw) noexcept
+    {
+        double invA0 = 1.0 / a0;
+        raw.b0 = static_cast<T>(static_cast<double>(raw.b0) * invA0);
+        raw.b1 = static_cast<T>(static_cast<double>(raw.b1) * invA0);
+        raw.b2 = static_cast<T>(static_cast<double>(raw.b2) * invA0);
+        raw.a1 = static_cast<T>(static_cast<double>(raw.a1) * invA0);
+        raw.a2 = static_cast<T>(static_cast<double>(raw.a2) * invA0);
+        return raw;
+    }
+};
+
+// ============================================================================
+// Biquad — Filter processor with per-channel state
+// ============================================================================
+
+/**
+ * @class Biquad
+ * @brief Biquad filter using Transposed Direct Form II (TDF-II).
+ *
+ * TDF-II is preferred for floating-point because:
+ * - Only 2 state variables (vs 4 for Direct Form I).
+ * - Better numerical properties — lower round-off noise.
+ * - No intermediate subtraction of large, nearly-equal numbers.
+ *
+ * Each channel has independent state, supporting mono through surround without
+ * separate filter instances.
+ *
+ * @tparam T           Sample type (float or double).
+ * @tparam MaxChannels Maximum number of independent filter channels.
+ */
+template <typename T, int MaxChannels = 8>
+class Biquad
+{
+public:
+    /**
+     * @brief Sets the filter coefficients.
+     *
+     * Can be called at any time. For smooth transitions, combine with
+     * coefficient interpolation in the caller.
+     *
+     * @param c New coefficient set.
+     */
+    void setCoeffs(const BiquadCoeffs<T>& c) noexcept { coeffs_ = c; }
+
+    /** @brief Returns the current coefficient set. */
+    [[nodiscard]] const BiquadCoeffs<T>& getCoeffs() const noexcept { return coeffs_; }
+
+    /** @brief Resets all per-channel filter state to zero. */
+    void reset() noexcept
+    {
+        for (auto& s : state_)
+            s = {};
+    }
+
+    /**
+     * @brief Processes a single sample through the filter for the given channel.
+     *
+     * Transposed Direct Form II:
+     * ```
+     *   y[n] = b0*x[n] + z1
+     *   z1   = b1*x[n] - a1*y[n] + z2
+     *   z2   = b2*x[n] - a2*y[n]
+     * ```
+     *
+     * @param input   Input sample.
+     * @param channel Channel index (0-based).
+     * @return Filtered output sample.
+     */
+    T processSample(T input, int channel) noexcept
+    {
+        auto& s = state_[channel];
+
+        const T output = coeffs_.b0 * input + s.z1;
+        s.z1 = coeffs_.b1 * input - coeffs_.a1 * output + s.z2;
+        s.z2 = coeffs_.b2 * input - coeffs_.a2 * output;
+
+        return output;
+    }
+
+    /**
+     * @brief Processes a full audio buffer in-place.
+     *
+     * Applies the filter to each channel independently. The buffer's channel
+     * count must not exceed MaxChannels.
+     *
+     * @param buffer Audio buffer to process in-place.
+     */
+    void processBlock(AudioBufferView<T> buffer) noexcept
+    {
+        DenormalGuard guard;
+        const int numChannels = std::min(buffer.getNumChannels(), MaxChannels);
+        const int numSamples  = buffer.getNumSamples();
+
+        for (int ch = 0; ch < numChannels; ++ch)
+        {
+            T* data = buffer.getChannel(ch);
+            for (int i = 0; i < numSamples; ++i)
+                data[i] = processSample(data[i], ch);
+        }
+    }
+
+private:
+    struct State
+    {
+        T z1 = T(0);
+        T z2 = T(0);
+    };
+
+    BiquadCoeffs<T>                coeffs_ {};
+    std::array<State, MaxChannels> state_  {};
+};
+
+} // namespace dspark

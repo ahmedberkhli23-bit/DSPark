@@ -1,0 +1,1343 @@
+// DSPark — Professional Audio DSP Framework
+// Copyright (c) 2026 Cristian Moresi — MIT License
+
+#pragma once
+
+/**
+ * @file AlgorithmicReverb.h
+ * @brief World-class 16-line FDN reverb with Jot absorption and Hadamard mixing.
+ *
+ * Professional reverb engine combining the best techniques from
+ * Jot/Chaigne (1991), Dattorro (1997), Griesinger/Lexicon, and
+ * Valhalla DSP research.
+ *
+ * Architecture:
+ * ```
+ * Input (mono sum)
+ *   │
+ *   ▼
+ * [Pre-delay: 0-200ms]
+ *   │
+ *   ▼
+ * [Input Diffusion: 8 cascaded allpass, 1.0-9.5ms]
+ *   │
+ *   ├──▶ [Early Reflections: 40 taps with progressive HF absorption, L/R decorrelated]
+ *   │
+ *   ├──▶ [ER-to-Late gap]
+ *   │       │
+ *   │       ▼
+ *   │    [Parallel Allpass Diffuser: 16 parallel AP + Hadamard → 16 delay + Hadamard]
+ *   │    (2-step, 16² = 256 echo paths, each FDN line gets unique dense input)
+ *   │       │
+ *   │       ▼
+ *   │    [FDN Core: 16 delay lines]
+ *   │      ├─ Read with dual smooth-random-LFO modulated delay
+ *   │      ├─ Hadamard 16×16 butterfly (O(N log N))
+ *   │      ├─ Jot absorption filter (1st-order shelving) per line
+ *   │      ├─ Bass shelf (1-pole) per line
+ *   │      ├─ 2 feedback allpass per line
+ *   │      ├─ DC blocker + soft limiter
+ *   │      └─ Write back + input injection
+ *   │       │
+ *   │       ▼
+ *   │    [Output: sign-weighted + Dattorro multi-tap]
+ *   │       │
+ *   │       ▼
+ *   │    [Output Diffusion: 2 allpass/channel, L/R decorrelated]
+ *   │
+ *   ▼
+ * [Combine early + late] → [Tone EQ: Biquad LP + HP (12 dB/oct)] → DryWetMixer → Output
+ * ```
+ *
+ * Key features:
+ * - **Jot absorption filter** (Jot 1991): 1st-order shelving IIR per delay line
+ *   for smooth frequency-dependent decay — the #1 factor for natural sound.
+ *   Separate bass shelf for independent LF control.
+ * - **Hadamard 16×16**: all eigenvalues ±1, zero coloring
+ * - **Parallel allpass diffuser** (Signalsmith-inspired): 16 parallel allpass
+ *   + 2-step Hadamard mixing → 256 unique echo paths per input sample.
+ *   Each FDN line receives a different, densely-mixed version of the input.
+ * - **Feedback allpass**: 2 regular allpass per delay line for in-loop density
+ * - **Output diffusion**: 2 allpass per channel with decorrelated delays,
+ *   smears residual temporal patterns
+ * - **Smooth random modulation** (Lexicon-style): Hermite-interpolated
+ *   noise replaces periodic sine LFOs for organic character
+ * - **Multi-tap output** (Dattorro-style): 7 taps/channel from different
+ *   delay line positions for true temporal decorrelation
+ * - **Tone correction EQ**: Biquad high/low cut (12 dB/oct) for tonal shaping
+ * - **Early reflections**: 40-tap with progressive frequency absorption
+ *   simulating wall absorption — late taps are naturally darker
+ * - **Soft saturation**: tanh-based smooth limiter (transparent below ±1,
+ *   asymptotically approaches ±2) — more musical than hard clamp
+ * - **Allpass interpolation**: in modulated FDN reads, preserves HF over
+ *   hundreds of feedback iterations (linear/cubic causes cumulative dulling)
+ * - **Stereo width**: M/S width control on late reverb tail
+ *
+ * Four levels of API complexity:
+ *
+ * - **Level 1:** `reverb.setType(Hall);`
+ * - **Level 2:** `reverb.setSize(0.7f); reverb.setDamping(0.3f);`
+ * - **Level 3:** `reverb.setHighDecayMultiplier(0.4f);`
+ * - **Level 4:** Inherit and override protected members.
+ *
+ * References:
+ * - Jot & Chaigne (1991) — FDN with frequency-dependent decay (shelving absorption)
+ * - Dattorro (1997, JAES) — Multi-tap output, plate topology
+ * - Griesinger / Lexicon 480L — Random modulation, Spin/Wander
+ * - Sean Costello / Valhalla DSP — Practical FDN design, absorbent allpass
+ * - Valimaki et al. (2012, IEEE) — "50 Years of Artificial Reverberation"
+ * - Smith (CCRMA) — Hadamard matrices, prime power delay selection
+ *
+ * Dependencies: RingBuffer.h, DryWetMixer.h, DspMath.h, Biquad.h,
+ *               AudioSpec.h, AudioBuffer.h.
+ *
+ * @code
+ *   dspark::AlgorithmicReverb<float> reverb;
+ *   reverb.prepare(spec);
+ *   reverb.setType(dspark::AlgorithmicReverb<float>::Type::Hall);
+ *   reverb.setDecay(2.0f);
+ *   reverb.setMix(0.3f);
+ *   reverb.processBlock(buffer);
+ *
+ *   // Advanced: tune frequency-dependent decay
+ *   reverb.setHighDecayMultiplier(0.4f);  // HF decays 2.5x faster
+ *   reverb.setBassDecayMultiplier(1.3f);  // bass lingers 1.3x longer
+ * @endcode
+ */
+
+#include "../Core/RingBuffer.h"
+#include "../Core/DryWetMixer.h"
+#include "../Core/DspMath.h"
+#include "../Core/AudioSpec.h"
+#include "../Core/AudioBuffer.h"
+#include "../Core/DenormalGuard.h"
+#include "../Core/Biquad.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <utility>
+
+namespace dspark {
+
+/**
+ * @class AlgorithmicReverb
+ * @brief 16-line FDN reverb with Jot absorption and 6 presets.
+ *
+ * @tparam T Sample type (float or double).
+ */
+template <FloatType T>
+class AlgorithmicReverb
+{
+public:
+    /** @brief Reverb type presets. */
+    enum class Type
+    {
+        Room,       ///< Small room, short decay, dense close reflections.
+        Hall,       ///< Concert hall, spacious, long smooth tail.
+        Chamber,    ///< Recording studio chamber, warm, balanced.
+        Plate,      ///< Metal plate, dense shimmer, no early reflections.
+        Spring,     ///< Spring reverb, bouncy vintage character.
+        Cathedral   ///< Large cathedral, immense decay, vast space.
+    };
+
+    virtual ~AlgorithmicReverb() = default;
+
+    // -- Lifecycle --------------------------------------------------------------
+
+    void prepare(const AudioSpec& spec)
+    {
+        spec_ = spec;
+        mixer_.prepare(spec);
+        double sr = spec.sampleRate;
+
+        preDelayBuf_.prepare(static_cast<int>(sr * 0.2) + 1);
+        erBuf_.prepare(static_cast<int>(sr * 0.2) + 1);
+        erToLateBuf_.prepare(static_cast<int>(sr * 0.2) + 1);
+
+        int maxDiff = static_cast<int>(sr * 0.012) + 1;
+        for (auto& buf : diffBufs_)
+            buf.prepare(maxDiff);
+
+        int maxFDN = static_cast<int>(sr * 0.5) + 1;
+        for (auto& dl : fdnDelays_)
+            dl.prepare(maxFDN);
+
+        // Parallel allpass diffuser — step 1 (~20ms max)
+        int maxParAP = static_cast<int>(sr * 0.021) + 1;
+        for (auto& buf : parAPBufs_) buf.prepare(maxParAP);
+
+        // Multi-channel diffuser — step 2 (~47ms max)
+        int maxDiffS2 = static_cast<int>(sr * 0.047) + 1;
+        for (auto& buf : diffuserStep2_) buf.prepare(maxDiffS2);
+
+        // Feedback allpass buffers (~60ms max, proportional to FDN delays)
+        int maxFbAP = static_cast<int>(sr * 0.06) + 1;
+        for (auto& buf : fbAPBufsA_) buf.prepare(maxFbAP);
+        for (auto& buf : fbAPBufsB_) buf.prepare(maxFbAP);
+
+        // Internal serial allpass buffers (~35ms max)
+        int maxIntAP = static_cast<int>(sr * 0.035) + 1;
+        for (auto& buf : intAPBufsA_) buf.prepare(maxIntAP);
+        for (auto& buf : intAPBufsB_) buf.prepare(maxIntAP);
+
+        // Output diffusion buffers (~3ms max)
+        int maxOutDiff = static_cast<int>(sr * 0.003) + 1;
+        for (auto& buf : outDiffBufsL_)
+            buf.prepare(maxOutDiff);
+        for (auto& buf : outDiffBufsR_)
+            buf.prepare(maxOutDiff);
+
+        // Initialize smooth random LFOs
+        for (int i = 0; i < kFDNSize; ++i)
+        {
+            modLFOA_[i].prepare(sr, modRate_ * (T(0.7) + T(0.05) * static_cast<T>(i)),
+                                static_cast<uint32_t>(i * 7919 + 1));
+            modLFOB_[i].prepare(sr, modRate_ * (T(1.8) + T(0.11) * static_cast<T>(i)),
+                                static_cast<uint32_t>(i * 6271 + 31337));
+        }
+
+        // DC block coefficient (~23 Hz, sample-rate independent)
+        dcCoeff_ = T(1) - std::exp(T(-6.283185307179586) * T(23)
+                                    / static_cast<T>(sr));
+
+        // Noise modulation: LP cutoff ~3 Hz, depth scales with modDepth_
+        noiseCoeff_ = T(1) - std::exp(T(-6.283185307179586) * T(3)
+                                       / static_cast<T>(sr));
+        noiseState_ = 1;
+        noiseLP_ = T(0);
+
+        applyPreset(type_);
+        reset();
+    }
+
+    void processBlock(AudioBufferView<T> buffer) noexcept
+    {
+        DenormalGuard guard;
+        const int nCh = std::min(buffer.getNumChannels(), 2);
+        const int nS  = buffer.getNumSamples();
+        if (nCh == 0 || nS == 0) return;
+
+        mixer_.pushDry(buffer);
+
+        for (int i = 0; i < nS; ++i)
+        {
+            T monoIn = T(0);
+            for (int ch = 0; ch < nCh; ++ch)
+                monoIn += buffer.getChannel(ch)[i];
+            monoIn /= static_cast<T>(nCh);
+
+            auto [outL, outR] = processSampleInternal(monoIn);
+
+            if (nCh >= 2)
+            {
+                buffer.getChannel(0)[i] = outL;
+                buffer.getChannel(1)[i] = outR;
+            }
+            else
+            {
+                buffer.getChannel(0)[i] = (outL + outR) * T(0.5);
+            }
+        }
+
+        mixer_.mixWet(buffer, mix_.load(std::memory_order_relaxed));
+    }
+
+    [[nodiscard]] std::pair<T, T> processSample(T input) noexcept
+    {
+        return processSampleInternal(input);
+    }
+
+    void reset() noexcept
+    {
+        preDelayBuf_.reset();
+        erBuf_.reset();
+        erToLateBuf_.reset();
+        for (auto& buf : diffBufs_) buf.reset();
+        for (auto& dl : fdnDelays_) dl.reset();
+        for (auto& buf : parAPBufs_) buf.reset();
+        for (auto& buf : diffuserStep2_) buf.reset();
+        for (auto& buf : fbAPBufsA_) buf.reset();
+        for (auto& buf : fbAPBufsB_) buf.reset();
+        for (auto& buf : intAPBufsA_) buf.reset();
+        for (auto& buf : intAPBufsB_) buf.reset();
+        for (auto& buf : outDiffBufsL_) buf.reset();
+        for (auto& buf : outDiffBufsR_) buf.reset();
+
+        absState_.fill(T(0));
+        bassState_.fill(T(0));
+        dcZ_.fill(T(0));
+        prevFeedback_.fill(T(0));
+        apInterpState_.fill(T(0));
+        erLPStateL_.fill(T(0));
+        erLPStateR_.fill(T(0));
+
+        for (auto& lfo : modLFOA_) lfo.reset();
+        for (auto& lfo : modLFOB_) lfo.reset();
+
+        toneLPBiquad_.reset();
+        toneHPBiquad_.reset();
+        mixer_.reset();
+    }
+
+    // =========================================================================
+    // Level 1: Simple API
+    // =========================================================================
+
+    void setType(Type type) { type_ = type; applyPreset(type); }
+
+    void setDecay(T seconds) noexcept
+    {
+        decayTime_ = std::clamp(seconds, T(0.1), T(30));
+        updateDecayParams();
+    }
+
+    void setMix(T dryWet) noexcept { mix_.store(std::clamp(dryWet, T(0), T(1)), std::memory_order_relaxed); }
+
+    // =========================================================================
+    // Level 2: Intermediate API
+    // =========================================================================
+
+    void setSize(T size) { size_ = std::clamp(size, T(0.01), T(1)); updateDelayLengths(); }
+
+    /**
+     * @brief Sets high-frequency damping (0 = bright, 1 = dark).
+     *
+     * Maps internally to highDecayMultiplier: 0->1.0 (HF=mid), 1->0.1 (HF 10x faster).
+     * For finer control, use setHighDecayMultiplier() directly.
+     */
+    void setDamping(T amount) noexcept
+    {
+        damping_ = std::clamp(amount, T(0), T(1));
+        highDecayMult_ = T(1) - damping_ * T(0.9);
+        updateDecayParams();
+    }
+
+    void setPreDelay(T ms) noexcept
+    {
+        preDelayMs_ = std::clamp(ms, T(0), T(200));
+        if (spec_.sampleRate > 0)
+            preDelaySamples_.store(static_cast<int>(
+                static_cast<T>(spec_.sampleRate) * preDelayMs_ / T(1000)),
+                std::memory_order_relaxed);
+    }
+
+    void setDiffusion(T amount) noexcept
+    {
+        diffusion_ = std::clamp(amount, T(0), T(1));
+        updateDiffCoeffs();
+    }
+
+    void setModulation(T amount) noexcept
+    {
+        modDepth_ = std::clamp(amount, T(0), T(1));
+        modDepthA_.store(modDepth_ * T(30), std::memory_order_relaxed);
+        modDepthB_.store(modDepth_ * T(15), std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Sets stereo width of the late reverb tail.
+     *
+     * Uses M/S processing: 0 = mono, 1 = natural stereo, 2 = extra wide.
+     * Applied after output diffusion, before combining with early reflections.
+     *
+     * @param width Stereo width (0.0 - 2.0). Default: 1.0.
+     */
+    void setWidth(T width) noexcept
+    {
+        width_.store(std::clamp(width, T(0), T(2)), std::memory_order_relaxed);
+    }
+
+    void setErToLateDelay(T ms) noexcept
+    {
+        erToLateMs_ = std::clamp(ms, T(0), T(200));
+        if (spec_.sampleRate > 0)
+            erToLateSamples_.store(static_cast<int>(
+                static_cast<T>(spec_.sampleRate) * erToLateMs_ / T(1000)),
+                std::memory_order_relaxed);
+    }
+
+    // =========================================================================
+    // Level 3: Expert API — Frequency-Dependent Decay
+    // =========================================================================
+
+    /**
+     * @brief Sets HF decay as a multiplier of mid decay time.
+     *
+     * 0.1 = HF decays 10x faster (very dark).
+     * 0.5 = HF decays 2x faster (natural room).
+     * 1.0 = HF same as mid (bright/metallic).
+     *
+     * @param mult Multiplier (0.05 - 1.0).
+     */
+    void setHighDecayMultiplier(T mult) noexcept
+    {
+        highDecayMult_ = std::clamp(mult, T(0.05), T(1));
+        damping_ = (T(1) - highDecayMult_) / T(0.9);
+        updateDecayParams();
+    }
+
+    /**
+     * @brief Sets bass decay as a multiplier of mid decay time.
+     *
+     * 0.5 = bass decays 2x faster (tight).
+     * 1.0 = bass same as mid (neutral).
+     * 1.5 = bass lingers 1.5x longer (natural large room).
+     * 2.0 = bass lingers 2x longer (boomy).
+     *
+     * @param mult Multiplier (0.3 - 3.0).
+     */
+    void setBassDecayMultiplier(T mult) noexcept
+    {
+        bassDecayMult_ = std::clamp(mult, T(0.3), T(3));
+        updateDecayParams();
+    }
+
+    /**
+     * @brief Frequency above which HF decay multiplier applies.
+     * @param hz Crossover in Hz (1000 - 16000). Default: 5000.
+     */
+    void setHighCrossover(T hz) noexcept
+    {
+        highCrossover_ = std::clamp(hz, T(1000), T(16000));
+    }
+
+    /**
+     * @brief Frequency below which bass decay multiplier applies.
+     * @param hz Crossover in Hz (50 - 500). Default: 200.
+     */
+    void setBassCrossover(T hz) noexcept
+    {
+        bassCrossover_ = std::clamp(hz, T(50), T(500));
+        if (spec_.sampleRate > 0)
+            bassLPCoeff_ = T(1) - std::exp(T(-6.283185307179586) * bassCrossover_
+                                            / static_cast<T>(spec_.sampleRate));
+    }
+
+    // =========================================================================
+    // Level 3: Expert API — Tone & Levels
+    // =========================================================================
+
+    void setEarlyLevel(T dB) noexcept
+    {
+        earlyLevel_.store(decibelsToGain(std::clamp(dB, T(-60), T(6))), std::memory_order_relaxed);
+    }
+
+    void setLateLevel(T dB) noexcept
+    {
+        lateLevel_.store(decibelsToGain(std::clamp(dB, T(-60), T(6))), std::memory_order_relaxed);
+    }
+
+    void setModRate(T hz) noexcept
+    {
+        modRate_ = std::clamp(hz, T(0.1), T(5));
+        updateModulation();
+    }
+
+    /**
+     * @brief Sets a post-reverb low-cut filter on the wet signal (12 dB/oct).
+     * @param hz Cutoff in Hz (0 = off, 20-500 typical).
+     */
+    void setToneLowCut(T hz) noexcept
+    {
+        if (hz <= T(0) || spec_.sampleRate <= 0) { toneHPActive_ = false; return; }
+        toneHPActive_ = true;
+        toneHPBiquad_.setCoeffs(BiquadCoeffs<T>::makeHighPass(
+            spec_.sampleRate, static_cast<double>(std::clamp(hz, T(20), T(500)))));
+    }
+
+    /**
+     * @brief Sets a post-reverb high-cut filter on the wet signal (12 dB/oct).
+     * @param hz Cutoff in Hz (0 = off, 2000-16000 typical).
+     */
+    void setToneHighCut(T hz) noexcept
+    {
+        if (hz <= T(0) || spec_.sampleRate <= 0) { toneLPActive_ = false; return; }
+        toneLPActive_ = true;
+        toneLPBiquad_.setCoeffs(BiquadCoeffs<T>::makeLowPass(
+            spec_.sampleRate, static_cast<double>(std::clamp(hz, T(2000), T(16000)))));
+    }
+
+    // =========================================================================
+    // Getters
+    // =========================================================================
+
+    [[nodiscard]] Type getType() const noexcept { return type_; }
+    [[nodiscard]] T getDecay() const noexcept { return decayTime_; }
+    [[nodiscard]] T getMix() const noexcept { return mix_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getHighDecayMultiplier() const noexcept { return highDecayMult_; }
+    [[nodiscard]] T getBassDecayMultiplier() const noexcept { return bassDecayMult_; }
+    [[nodiscard]] T getWidth() const noexcept { return width_.load(std::memory_order_relaxed); }
+    [[nodiscard]] T getHighCrossover() const noexcept { return highCrossover_; }
+    [[nodiscard]] T getBassCrossover() const noexcept { return bassCrossover_; }
+
+protected:
+    // --- Constants -----------------------------------------------------------
+
+    static constexpr int kFDNSize      = 16;
+    static constexpr int kDiffStages   = 8;
+    static constexpr int kMaxERTaps    = 40;
+    static constexpr int kNumMultiTaps = 7;
+    static constexpr int kOutDiffStages = 2;
+
+    static constexpr T kInputGain = T(1) / T(8);
+
+    // Output normalization: 16 main + 7 multi-tap + fbAP taps + intAP taps
+    static constexpr T kOutputNorm = T(1) / T(5.0);
+
+    // Orthogonal stereo output sign vectors (inner product = 0)
+    static constexpr int kOutSignL_[kFDNSize] = {
+         1, -1,  1,  1, -1,  1, -1, -1,
+         1, -1, -1,  1, -1,  1,  1, -1
+    };
+    static constexpr int kOutSignR_[kFDNSize] = {
+         1,  1, -1,  1,  1, -1, -1, -1,
+        -1,  1, -1,  1, -1, -1,  1,  1
+    };
+
+    // Multi-tap output: Dattorro-style decorrelation from different delay positions
+    static constexpr int    kMultiTapLineL_[kNumMultiTaps] = {0, 2, 5, 7, 9, 12, 14};
+    static constexpr int    kMultiTapLineR_[kNumMultiTaps] = {1, 3, 4, 8, 10, 13, 15};
+    static constexpr double kMultiTapFracL_[kNumMultiTaps] = {0.37, 0.67, 0.23, 0.81, 0.44, 0.59, 0.31};
+    static constexpr double kMultiTapFracR_[kNumMultiTaps] = {0.43, 0.71, 0.29, 0.63, 0.47, 0.53, 0.37};
+    static constexpr int    kMultiTapSignL_[kNumMultiTaps] = {+1, -1, +1, -1, +1, -1, +1};
+    static constexpr int    kMultiTapSignR_[kNumMultiTaps] = {+1, +1, -1, +1, -1, +1, -1};
+
+    // FDN base delay times in ms (at size=1.0)
+    static constexpr double kBaseDelaysMs_[kFDNSize] = {
+        29.7, 34.1, 39.3, 45.2, 52.0, 58.1, 64.9, 72.3,
+        80.4, 89.0, 98.3, 108.7, 119.9, 132.3, 145.7, 160.1
+    };
+
+    // Input diffusion allpass delays (ms) — 8 stages (Dattorro-style, ~34ms total)
+    static constexpr double kDiffDelaysMs_[kDiffStages] = {
+        1.03, 1.47, 2.19, 3.13, 4.23, 5.59, 7.19, 9.47
+    };
+
+    static constexpr double kDiffBaseCoeffs_[kDiffStages] = {
+        0.75, 0.75, 0.72, 0.72, 0.70, 0.70, 0.68, 0.68
+    };
+
+    // Feedback allpass stages per FDN line (echo density multiplier)
+    static constexpr int kFbAPStages = 2;
+
+    // Feedback allpass delays as fraction of FDN delay (Dattorro-style proportional)
+    static constexpr double kFbAPRatioA_ = 0.25;  // 25% of FDN delay
+    static constexpr double kFbAPRatioB_ = 0.35;  // 35% of FDN delay
+
+    // Parallel allpass diffuser — step 1 delays (ms, per channel, different IRs)
+    static constexpr double kParAPDelaysMs_[kFDNSize] = {
+        5.3, 6.1, 7.1, 7.9, 8.9, 9.7, 10.7, 11.7,
+        12.3, 13.3, 14.3, 15.1, 16.1, 17.1, 18.1, 19.1
+    };
+
+    // Multi-channel diffuser — step 2 per-channel delays (ms)
+    static constexpr double kDiffuserStep2Ms_[kFDNSize] = {
+        15.7, 17.9, 20.1, 22.3, 24.7, 26.9, 29.3, 31.1,
+        33.7, 35.3, 37.1, 39.3, 41.1, 42.9, 44.3, 45.7
+    };
+
+    // Output diffusion allpass delays (ms, decorrelated L/R)
+    static constexpr double kOutDiffDelaysMsL_[kOutDiffStages] = {1.47, 2.31};
+    static constexpr double kOutDiffDelaysMsR_[kOutDiffStages] = {1.63, 2.47};
+
+    // =========================================================================
+    // Smooth Random LFO (Lexicon-style modulation)
+    // =========================================================================
+
+    /**
+     * @brief Hermite-interpolated random noise generator for organic modulation.
+     *
+     * Generates band-limited random values via cubic Hermite (Catmull-Rom)
+     * interpolation between xorshift32 random targets. Produces smooth,
+     * non-periodic modulation — the key to Lexicon-quality reverb character.
+     */
+    struct SmoothRandomLFO
+    {
+        T h0_ = T(0), h1_ = T(0), h2_ = T(0), h3_ = T(0);
+        T phase_ = T(0);
+        T phaseInc_ = T(0);
+        uint32_t state_ = 1;
+
+        void prepare(double sr, T rate, uint32_t seed) noexcept
+        {
+            phaseInc_ = rate / static_cast<T>(sr);
+            state_ = seed ? seed : 1;
+            h0_ = nextRandom(); h1_ = nextRandom();
+            h2_ = nextRandom(); h3_ = nextRandom();
+            phase_ = T(0);
+        }
+
+        void setRate(T rate, double sr) noexcept
+        {
+            phaseInc_ = rate / static_cast<T>(sr);
+        }
+
+        T next() noexcept
+        {
+            phase_ += phaseInc_;
+            if (phase_ >= T(1))
+            {
+                phase_ -= T(1);
+                h0_ = h1_; h1_ = h2_; h2_ = h3_;
+                h3_ = nextRandom();
+            }
+            // Cubic Hermite (Catmull-Rom) interpolation
+            T d = phase_;
+            T c0 = h1_;
+            T c1 = T(0.5) * (h2_ - h0_);
+            T c2 = h0_ - T(2.5) * h1_ + T(2) * h2_ - T(0.5) * h3_;
+            T c3 = T(0.5) * (h3_ - h0_) + T(1.5) * (h1_ - h2_);
+            return ((c3 * d + c2) * d + c1) * d + c0;
+        }
+
+        void reset() noexcept { phase_ = T(0); h0_ = h1_ = h2_ = h3_ = T(0); }
+
+    private:
+        T nextRandom() noexcept
+        {
+            state_ ^= state_ << 13;
+            state_ ^= state_ >> 17;
+            state_ ^= state_ << 5;
+            return static_cast<T>(state_)
+                   / static_cast<T>(0xFFFFFFFFu) * T(2) - T(1);
+        }
+    };
+
+    // --- State ---------------------------------------------------------------
+
+    AudioSpec spec_ {};
+
+    // FDN delay lines
+    std::array<RingBuffer<T>, kFDNSize> fdnDelays_;
+    std::array<int, kFDNSize> fdnDelayLens_ {};
+
+    // Jot absorption filter state (per line)
+    std::array<T, kFDNSize> absB0_ {};       // feedforward: g_mid * (1 - damp)
+    std::array<T, kFDNSize> absA1_ {};       // feedback: damp coefficient
+    std::array<T, kFDNSize> absState_ {};    // filter state
+
+    // Bass shelf state (per line)
+    std::array<T, kFDNSize> bassRatio_ {};   // g_bass / g_mid
+    std::array<T, kFDNSize> bassState_ {};   // 1-pole LP state
+
+    // DC blocker state
+    std::array<T, kFDNSize> dcZ_ {};
+
+    // Feedback allpass (2 stages per FDN line, density multiplier)
+    std::array<RingBuffer<T>, kFDNSize> fbAPBufsA_;
+    std::array<RingBuffer<T>, kFDNSize> fbAPBufsB_;
+    std::array<int, kFDNSize> fbAPDelaysA_ {};
+    std::array<int, kFDNSize> fbAPDelaysB_ {};
+    T fbAPCoeff_ = T(0.6);
+
+    // Internal serial allpasses (per FDN line, pre-write + post-read)
+    std::array<RingBuffer<T>, kFDNSize> intAPBufsA_;  // pre-write
+    std::array<RingBuffer<T>, kFDNSize> intAPBufsB_;  // post-read
+    std::array<int, kFDNSize> intAPDelaysA_ {};
+    std::array<int, kFDNSize> intAPDelaysB_ {};
+    static constexpr T intAPCoeff_ = T(0.5);  // Infinity2 uses 0.5
+    static constexpr double kIntAPRatioA_ = 0.15;  // 15% of FDN delay
+    static constexpr double kIntAPRatioB_ = 0.20;  // 20% of FDN delay
+
+    // Feedback IIR smoothing (Verbity technique: eliminates discrete-echo quality)
+    std::array<T, kFDNSize> prevFeedback_ {};
+    T fbSmooth_ = T(0.3);
+
+    // Smooth random modulation (2 per line = 32 total)
+    std::array<SmoothRandomLFO, kFDNSize> modLFOA_;
+    std::array<SmoothRandomLFO, kFDNSize> modLFOB_;
+
+    // Allpass interpolation state for modulated FDN reads (preserves HF)
+    std::array<T, kFDNSize> apInterpState_ {};
+
+    // Filtered noise for modulation randomization (Progenitor-style)
+    uint32_t noiseState_ = 1;
+    T noiseLP_ = T(0);
+    T noiseCoeff_ = T(0);
+    T noiseDepth_ = T(0);
+
+    // Input diffusion
+    std::array<RingBuffer<T>, kDiffStages> diffBufs_;
+    std::array<int, kDiffStages> diffDelays_ {};
+    std::array<T, kDiffStages> diffCoeffs_ {};
+
+    // Parallel allpass diffuser — step 1 (16 parallel allpass, different delays)
+    std::array<RingBuffer<T>, kFDNSize> parAPBufs_;
+    std::array<int, kFDNSize> parAPDelays_ {};
+    T parAPCoeff_ = T(0.65);
+
+    // Multi-channel diffuser — step 2 (16 per-channel delay buffers)
+    std::array<RingBuffer<T>, kFDNSize> diffuserStep2_;
+    std::array<int, kFDNSize> diffuserStep2Delays_ {};
+
+    // Output diffusion (L/R decorrelated)
+    std::array<RingBuffer<T>, kOutDiffStages> outDiffBufsL_;
+    std::array<RingBuffer<T>, kOutDiffStages> outDiffBufsR_;
+    std::array<int, kOutDiffStages> outDiffDelaysL_ {};
+    std::array<int, kOutDiffStages> outDiffDelaysR_ {};
+    T outDiffCoeff_ = T(0.45);
+
+    // Early reflections
+    RingBuffer<T> erBuf_;
+    std::array<int, kMaxERTaps> erTapsL_ {}, erTapsR_ {};
+    std::array<T, kMaxERTaps> erGainsL_ {}, erGainsR_ {};
+    std::array<T, kMaxERTaps> erAbsCoeffs_ {};
+    std::array<T, kMaxERTaps> erLPStateL_ {};
+    std::array<T, kMaxERTaps> erLPStateR_ {};
+    int numERTaps_ = 0;
+
+    // Pre-delay
+    RingBuffer<T> preDelayBuf_;
+    std::atomic<int> preDelaySamples_ { 0 };
+
+    // ER-to-late gap
+    RingBuffer<T> erToLateBuf_;
+    std::atomic<int> erToLateSamples_ { 0 };
+
+    // Tone correction EQ (Biquad 12 dB/oct)
+    Biquad<T, 2> toneLPBiquad_;
+    Biquad<T, 2> toneHPBiquad_;
+    bool toneLPActive_ = false;
+    bool toneHPActive_ = false;
+
+    // Mixer
+    DryWetMixer<T> mixer_;
+
+    // --- Parameters ----------------------------------------------------------
+
+    Type type_           = Type::Room;
+    T decayTime_         = T(1);
+    T size_              = T(0.5);
+    T damping_           = T(0.5);
+    T diffusion_         = T(0.7);
+    T modDepth_          = T(0.1);
+    T modRate_           = T(1);
+    T preDelayMs_        = T(0);
+    T erToLateMs_        = T(0);
+    std::atomic<T> mix_          { T(0.3) };
+    std::atomic<T> earlyLevel_  { T(1) };
+    std::atomic<T> lateLevel_   { T(1) };
+    std::atomic<T> width_       { T(1) };     // Stereo width: 0=mono, 1=natural, 2=wide
+
+    // Frequency-dependent decay parameters
+    T highDecayMult_     = T(0.5);   // HF T60 multiplier (0.05-1.0)
+    T bassDecayMult_     = T(1.2);   // bass T60 multiplier (0.3-3.0)
+    T highCrossover_     = T(5000);  // Hz
+    T bassCrossover_     = T(200);   // Hz
+
+    // --- Computed coefficients ------------------------------------------------
+
+    T bassLPCoeff_ = T(0.026);   // bass crossover filter coeff
+    T dcCoeff_     = T(0.003);   // DC blocker coeff (~23Hz)
+    std::atomic<T> modDepthA_ { T(1) };       // slow LFO depth in samples
+    std::atomic<T> modDepthB_ { T(0.5) };     // fast LFO depth in samples
+
+    // =========================================================================
+    // Processing helpers
+    // =========================================================================
+
+    /// Lowpass-filtered white noise for modulation randomization.
+    T nextFilteredNoise() noexcept
+    {
+        noiseState_ = noiseState_ * 196314165u + 907633515u;
+        T white = static_cast<T>(static_cast<int32_t>(noiseState_))
+                  / T(2147483648.0);
+        noiseLP_ += noiseCoeff_ * (white - noiseLP_);
+        return noiseLP_;
+    }
+
+    T processAllpass(RingBuffer<T>& buf, int delay, T coeff, T input) noexcept
+    {
+        T delayed = buf.read(delay);
+        T temp = input + coeff * delayed;
+        T output = delayed - coeff * temp;
+        buf.push(temp);
+        return output;
+    }
+
+    T processAllpassModulated(RingBuffer<T>& buf, int baseDelay, T modAmount,
+                              T coeff, T input) noexcept
+    {
+        T readPos = static_cast<T>(baseDelay) + modAmount;
+        readPos = std::max(readPos, T(1));
+        T delayed = buf.readInterpolated(readPos);
+        T temp = input + coeff * delayed;
+        T output = delayed - coeff * temp;
+        buf.push(temp);
+        return output;
+    }
+
+    /**
+     * @brief In-place Hadamard 16x16 via Fast Walsh-Hadamard butterfly.
+     *
+     * 4-stage butterfly, 64 add/sub, normalized by 1/sqrt(16)=1/4.
+     * Used in diffusion stages where maximum inter-channel mixing is desired.
+     */
+    static void hadamardInPlace(std::array<T, kFDNSize>& x) noexcept
+    {
+        for (int i = 0; i < kFDNSize; i += 2)
+        { T a = x[i], b = x[i+1]; x[i] = a + b; x[i+1] = a - b; }
+
+        for (int i = 0; i < kFDNSize; i += 4)
+            for (int j = 0; j < 2; ++j)
+            { T a = x[i+j], b = x[i+j+2]; x[i+j] = a + b; x[i+j+2] = a - b; }
+
+        for (int i = 0; i < kFDNSize; i += 8)
+            for (int j = 0; j < 4; ++j)
+            { T a = x[i+j], b = x[i+j+4]; x[i+j] = a + b; x[i+j+4] = a - b; }
+
+        for (int j = 0; j < 8; ++j)
+        { T a = x[j], b = x[j+8]; x[j] = a + b; x[j+8] = a - b; }
+
+        for (auto& v : x) v *= T(0.25);
+    }
+
+    /**
+     * @brief In-place Householder reflection for 16 channels.
+     *
+     * H = I - (2/N) * ones. Each output = input - (2/N) * sum.
+     * Provides moderate cross-feeding without locking delays together,
+     * as recommended by Signalsmith for FDN feedback mixing.
+     */
+    static void householderInPlace(std::array<T, kFDNSize>& x) noexcept
+    {
+        T sum = T(0);
+        for (int i = 0; i < kFDNSize; ++i) sum += x[i];
+        T factor = sum * T(2) / T(kFDNSize);  // 2/N * sum = sum/8
+        for (int i = 0; i < kFDNSize; ++i) x[i] -= factor;
+    }
+
+    /// Core per-sample processing — returns wet {L, R}.
+    std::pair<T, T> processSampleInternal(T input) noexcept
+    {
+        // Cache atomic params for this sample
+        int preDelSamp = preDelaySamples_.load(std::memory_order_relaxed);
+        int erToLateSamp = erToLateSamples_.load(std::memory_order_relaxed);
+        T earlyLvl = earlyLevel_.load(std::memory_order_relaxed);
+        T lateLvl = lateLevel_.load(std::memory_order_relaxed);
+        T widthVal = width_.load(std::memory_order_relaxed);
+        T modDA = modDepthA_.load(std::memory_order_relaxed);
+        T modDB = modDepthB_.load(std::memory_order_relaxed);
+
+        // --- Pre-delay ---
+        preDelayBuf_.push(input);
+        T delayed = (preDelSamp > 0)
+            ? preDelayBuf_.read(preDelSamp) : input;
+
+        // --- Input diffusion: 8 cascaded modulated allpass ---
+        T diffused = delayed;
+        T diffNoise = nextFilteredNoise();
+        for (int d = 0; d < kDiffStages; ++d)
+        {
+            T diffPol = (d & 1) ? T(-1) : T(1);
+            T diffMod = diffNoise * T(2) * diffPol;  // +/-2 samples excursion
+            diffused = processAllpassModulated(diffBufs_[d], diffDelays_[d],
+                                               diffMod, diffCoeffs_[d], diffused);
+        }
+
+        // --- Early reflections with progressive absorption ---
+        erBuf_.push(diffused);
+        T earlyL = T(0), earlyR = T(0);
+        for (int t = 0; t < numERTaps_; ++t)
+        {
+            T rawL = erBuf_.read(erTapsL_[t]) * erGainsL_[t];
+            T rawR = erBuf_.read(erTapsR_[t]) * erGainsR_[t];
+            // Progressive 1-pole LP: later taps are darker (wall absorption)
+            erLPStateL_[t] += erAbsCoeffs_[t] * (rawL - erLPStateL_[t]);
+            erLPStateR_[t] += erAbsCoeffs_[t] * (rawR - erLPStateR_[t]);
+            earlyL += erLPStateL_[t];
+            earlyR += erLPStateR_[t];
+        }
+        earlyL *= earlyLvl;
+        earlyR *= earlyLvl;
+
+        // --- ER-to-late gap ---
+        erToLateBuf_.push(diffused);
+        T fdnInputRaw = (erToLateSamp > 0)
+            ? erToLateBuf_.read(erToLateSamp) : diffused;
+
+        // --- Parallel allpass diffuser (2-step, 16² = 256 echo paths) ---
+        // Step 1: 16 parallel allpass with different delays create 16 unique IRs
+        std::array<T, kFDNSize> diffCh;
+        for (int d = 0; d < kFDNSize; ++d)
+            diffCh[d] = processAllpass(parAPBufs_[d], parAPDelays_[d],
+                                        parAPCoeff_, fdnInputRaw);
+        hadamardInPlace(diffCh);
+        // Step 2: per-channel delay + Hadamard → 256 unique paths
+        for (int d = 0; d < kFDNSize; ++d)
+            diffuserStep2_[d].push(diffCh[d]);
+        for (int d = 0; d < kFDNSize; ++d)
+            diffCh[d] = diffuserStep2_[d].read(diffuserStep2Delays_[d]);
+        hadamardInPlace(diffCh);
+
+        // =================================================================
+        // FDN Core
+        // =================================================================
+
+        // Read from 16 delay lines with LFO + noise modulated delay
+        std::array<T, kFDNSize> reads;
+        std::array<T, kFDNSize> modBValues;
+        T noise = nextFilteredNoise();
+        for (int d = 0; d < kFDNSize; ++d)
+        {
+            T modA = modLFOA_[d].next() * modDA;
+            T modB = modLFOB_[d].next() * modDB;
+            modBValues[d] = modB;
+            // Noise with alternating polarity (Progenitor-style)
+            T polarity = (d & 1) ? T(-1) : T(1);
+            T noiseMod = noise * noiseDepth_ * polarity;
+            T readPos = static_cast<T>(fdnDelayLens_[d]) + modA + modB + noiseMod;
+            readPos = std::max(readPos, T(1));
+            // Allpass interpolation: preserves HF over hundreds of feedback
+            // iterations (linear/cubic causes cumulative dulling).
+            // Formula: z1 = older + frac*(newer - z1)  [Progenitor2-style]
+            {
+                int readInt = static_cast<int>(readPos);
+                T frac = readPos - static_cast<T>(readInt);
+                T newer = fdnDelays_[d].read(readInt);
+                T older = fdnDelays_[d].read(readInt + 1);
+                apInterpState_[d] = older + frac * (newer - apInterpState_[d]);
+                reads[d] = apInterpState_[d];
+            }
+            // Post-read serial allpass (density multiplier, Infinity2-style)
+            reads[d] = processAllpass(intAPBufsB_[d], intAPDelaysB_[d],
+                                       intAPCoeff_, reads[d]);
+        }
+
+        // Householder 16x16 mixing (moderate coupling, keeps lines independent)
+        std::array<T, kFDNSize> mixed = reads;
+        householderInPlace(mixed);
+
+        // Per-line: Jot absorption → bass shelf → feedback allpass → write
+        for (int d = 0; d < kFDNSize; ++d)
+        {
+            T val = mixed[d];
+
+            // --- Jot absorption filter (1st-order shelving, Jot 1991) ---
+            // y[n] = b0 * x[n] + a1 * y[n-1]
+            // At DC: gain = g_mid. At Nyquist: gain = g_high.
+            absState_[d] = absB0_[d] * val + absA1_[d] * absState_[d];
+            val = absState_[d];
+
+            // --- Bass shelf (independent LF control) ---
+            bassState_[d] += bassLPCoeff_ * (val - bassState_[d]);
+            val += bassState_[d] * (bassRatio_[d] - T(1));
+
+            // --- Feedback allpass (2 stages, modulated, Dattorro-style) ---
+            {
+                T fbMod = modBValues[d] * T(0.3);
+                val = processAllpassModulated(fbAPBufsA_[d], fbAPDelaysA_[d],
+                                              fbMod, fbAPCoeff_, val);
+                val = processAllpassModulated(fbAPBufsB_[d], fbAPDelaysB_[d],
+                                              fbMod * T(-0.7), fbAPCoeff_, val);
+            }
+
+            // --- DC blocker (~23 Hz) ---
+            dcZ_[d] += dcCoeff_ * (val - dcZ_[d]);
+            val -= dcZ_[d];
+
+            // --- Soft saturation (transparent below ±1, approaches ±2) ---
+            // More musical than hard clamp: preserves transient shape
+            if (val > T(1))
+                val = T(1) + std::tanh(val - T(1));
+            else if (val < T(-1))
+                val = T(-1) - std::tanh(T(-1) - val);
+
+            // --- Pre-write serial allpass (density, Infinity2-style) ---
+            val = processAllpass(intAPBufsA_[d], intAPDelaysA_[d],
+                                  intAPCoeff_, val);
+
+            // --- Feedback IIR smoothing (Verbity technique) ---
+            val = val * (T(1) - fbSmooth_) + prevFeedback_[d] * fbSmooth_;
+            prevFeedback_[d] = val;
+
+            // --- Write back with per-line diffuser output ---
+            fdnDelays_[d].push(val + diffCh[d] * kInputGain);
+        }
+
+        // --- Stereo output ---
+
+        // Main: orthogonal sign-weighted from all 16 reads
+        T lateL = T(0), lateR = T(0);
+        for (int d = 0; d < kFDNSize; ++d)
+        {
+            lateL += reads[d] * static_cast<T>(kOutSignL_[d]);
+            lateR += reads[d] * static_cast<T>(kOutSignR_[d]);
+        }
+
+        // Multi-tap: Dattorro-style reads from different delay positions
+        for (int t = 0; t < kNumMultiTaps; ++t)
+        {
+            int posL = std::max(1, static_cast<int>(
+                fdnDelayLens_[kMultiTapLineL_[t]] * kMultiTapFracL_[t]));
+            int posR = std::max(1, static_cast<int>(
+                fdnDelayLens_[kMultiTapLineR_[t]] * kMultiTapFracR_[t]));
+            lateL += fdnDelays_[kMultiTapLineL_[t]].read(posL)
+                     * static_cast<T>(kMultiTapSignL_[t]) * T(0.7);
+            lateR += fdnDelays_[kMultiTapLineR_[t]].read(posR)
+                     * static_cast<T>(kMultiTapSignR_[t]) * T(0.7);
+        }
+
+        // Feedback allpass taps (Dattorro-style: read from within AP buffers)
+        for (int d = 0; d < kFDNSize; d += 2)
+        {
+            int tapA = std::max(1, fbAPDelaysA_[d] * 2 / 3);
+            int tapB = std::max(1, fbAPDelaysB_[d] * 3 / 5);
+            lateL += fbAPBufsA_[d].read(tapA) * static_cast<T>(kOutSignL_[d]) * T(0.35);
+            lateR += fbAPBufsB_[d].read(tapB) * static_cast<T>(kOutSignR_[d]) * T(0.35);
+        }
+        for (int d = 1; d < kFDNSize; d += 2)
+        {
+            int tapA = std::max(1, fbAPDelaysA_[d] * 3 / 5);
+            int tapB = std::max(1, fbAPDelaysB_[d] * 2 / 3);
+            lateL += fbAPBufsB_[d].read(tapB) * static_cast<T>(kOutSignL_[d]) * T(0.35);
+            lateR += fbAPBufsA_[d].read(tapA) * static_cast<T>(kOutSignR_[d]) * T(0.35);
+        }
+
+        // Internal serial allpass taps (additional temporal smearing)
+        for (int d = 0; d < kFDNSize; d += 2)
+        {
+            int tapA = std::max(1, intAPDelaysA_[d] * 2 / 3);
+            int tapB = std::max(1, intAPDelaysB_[d] * 3 / 5);
+            lateL += intAPBufsA_[d].read(tapA) * static_cast<T>(kOutSignL_[d]) * T(0.2);
+            lateR += intAPBufsB_[d].read(tapB) * static_cast<T>(kOutSignR_[d]) * T(0.2);
+        }
+        for (int d = 1; d < kFDNSize; d += 2)
+        {
+            int tapA = std::max(1, intAPDelaysA_[d] * 3 / 5);
+            int tapB = std::max(1, intAPDelaysB_[d] * 2 / 3);
+            lateL += intAPBufsB_[d].read(tapB) * static_cast<T>(kOutSignL_[d]) * T(0.2);
+            lateR += intAPBufsA_[d].read(tapA) * static_cast<T>(kOutSignR_[d]) * T(0.2);
+        }
+
+        lateL *= lateLvl * kOutputNorm;
+        lateR *= lateLvl * kOutputNorm;
+
+        // --- Output diffusion (L/R decorrelated allpass) ---
+        for (int s = 0; s < kOutDiffStages; ++s)
+        {
+            lateL = processAllpass(outDiffBufsL_[s], outDiffDelaysL_[s],
+                                   outDiffCoeff_, lateL);
+            lateR = processAllpass(outDiffBufsR_[s], outDiffDelaysR_[s],
+                                   outDiffCoeff_, lateR);
+        }
+
+        // --- Stereo width (M/S on late tail only) ---
+        {
+            T mid  = (lateL + lateR) * T(0.5);
+            T side = (lateL - lateR) * T(0.5);
+            side *= widthVal;
+            lateL = mid + side;
+            lateR = mid - side;
+        }
+
+        // --- Combine early + late ---
+        T outL = earlyL + lateL;
+        T outR = earlyR + lateR;
+
+        // --- Tone correction EQ (Biquad 12 dB/oct) ---
+        if (toneHPActive_)
+        {
+            outL = toneHPBiquad_.processSample(outL, 0);
+            outR = toneHPBiquad_.processSample(outR, 1);
+        }
+        if (toneLPActive_)
+        {
+            outL = toneLPBiquad_.processSample(outL, 0);
+            outR = toneLPBiquad_.processSample(outR, 1);
+        }
+
+        return { outL, outR };
+    }
+
+    // =========================================================================
+    // Coefficient update helpers
+    // =========================================================================
+
+    /**
+     * @brief Computes per-line Jot absorption filter coefficients.
+     *
+     * Implements Jot/Chaigne (1991): each delay line gets a 1st-order
+     * shelving IIR that produces frequency-dependent decay.
+     *
+     * H(z) = b0 / (1 - a1 * z^-1)
+     *
+     * where |H(1)| = g_mid (decay at DC/mid) and |H(-1)| = g_high (decay at Nyquist).
+     */
+    void updateDecayParams() noexcept
+    {
+        if (spec_.sampleRate <= 0 || decayTime_ <= T(0)) return;
+
+        T sr = static_cast<T>(spec_.sampleRate);
+        T t60Mid  = decayTime_;
+        T t60High = decayTime_ * highDecayMult_;
+        T t60Bass = decayTime_ * bassDecayMult_;
+
+        t60High = std::max(t60High, T(0.05));
+        t60Bass = std::max(t60Bass, T(0.05));
+
+        for (int d = 0; d < kFDNSize; ++d)
+        {
+            // Total loop delay = FDN delay + feedback APs + internal APs
+            T M = static_cast<T>(fdnDelayLens_[d] + fbAPDelaysA_[d] + fbAPDelaysB_[d]
+                                  + intAPDelaysA_[d] + intAPDelaysB_[d]);
+            if (M < T(1)) M = T(1);
+
+            // Per-loop gains: g = 0.001^(M / (T60 * sr))
+            T gMid  = std::pow(T(0.001), M / (t60Mid * sr));
+            T gHigh = std::pow(T(0.001), M / (t60High * sr));
+            T gBass = std::pow(T(0.001), M / (t60Bass * sr));
+
+            // Jot damping coefficient: smooth shelving from gMid (DC) to gHigh (Nyquist)
+            T damp = (gMid - gHigh) / (gMid + gHigh + T(1e-10));
+            damp = std::clamp(damp, T(0), T(0.999));
+
+            // Precomputed filter coefficients
+            absB0_[d] = gMid * (T(1) - damp);   // feedforward
+            absA1_[d] = damp;                     // feedback (pole)
+
+            // Bass ratio for independent LF control
+            bassRatio_[d] = gBass / (gMid + T(1e-10));
+            bassRatio_[d] = std::clamp(bassRatio_[d], T(0.1), T(3));
+        }
+
+        // Bass crossover filter coefficient
+        bassLPCoeff_ = T(1) - std::exp(T(-6.283185307179586) * bassCrossover_ / sr);
+    }
+
+    void updateDelayLengths()
+    {
+        double sr = spec_.sampleRate;
+        // Nonlinear size mapping: size=0 -> 0.35, size=1 -> 1.0
+        double sz = 0.35 + 0.65 * static_cast<double>(size_);
+
+        for (int d = 0; d < kFDNSize; ++d)
+        {
+            int raw = std::max(1, static_cast<int>(
+                kBaseDelaysMs_[d] * sz * sr / 1000.0));
+            fdnDelayLens_[d] = nearestPrime(raw);
+        }
+
+        for (int d = 0; d < kDiffStages; ++d)
+            diffDelays_[d] = nearestPrime(std::max(1,
+                static_cast<int>(kDiffDelaysMs_[d] * sr / 1000.0)));
+
+        for (int d = 0; d < kFDNSize; ++d)
+        {
+            fbAPDelaysA_[d] = nearestPrime(std::max(1,
+                static_cast<int>(fdnDelayLens_[d] * kFbAPRatioA_)));
+            fbAPDelaysB_[d] = nearestPrime(std::max(1,
+                static_cast<int>(fdnDelayLens_[d] * kFbAPRatioB_)));
+            intAPDelaysA_[d] = nearestPrime(std::max(1,
+                static_cast<int>(fdnDelayLens_[d] * kIntAPRatioA_)));
+            intAPDelaysB_[d] = nearestPrime(std::max(1,
+                static_cast<int>(fdnDelayLens_[d] * kIntAPRatioB_)));
+        }
+
+        for (int s = 0; s < kOutDiffStages; ++s)
+        {
+            outDiffDelaysL_[s] = nearestPrime(std::max(1,
+                static_cast<int>(kOutDiffDelaysMsL_[s] * sr / 1000.0)));
+            outDiffDelaysR_[s] = nearestPrime(std::max(1,
+                static_cast<int>(kOutDiffDelaysMsR_[s] * sr / 1000.0)));
+        }
+
+        // Parallel allpass diffuser — step 1 delays
+        for (int d = 0; d < kFDNSize; ++d)
+            parAPDelays_[d] = nearestPrime(std::max(1,
+                static_cast<int>(kParAPDelaysMs_[d] * sr / 1000.0)));
+
+        // Multi-channel diffuser — step 2 delays
+        for (int d = 0; d < kFDNSize; ++d)
+            diffuserStep2Delays_[d] = nearestPrime(std::max(1,
+                static_cast<int>(kDiffuserStep2Ms_[d] * sr / 1000.0)));
+
+        updateDecayParams();
+    }
+
+    void updateDiffCoeffs() noexcept
+    {
+        for (int d = 0; d < kDiffStages; ++d)
+            diffCoeffs_[d] = static_cast<T>(kDiffBaseCoeffs_[d]) * diffusion_;
+        outDiffCoeff_ = T(0.45) * diffusion_;
+        fbAPCoeff_ = T(0.3) + T(0.4) * diffusion_;  // Dattorro range 0.3-0.7
+        // Feedback IIR smoothing: higher diffusion = more smoothing
+        fbSmooth_ = T(0.1) + T(0.25) * diffusion_;   // range 0.1-0.35
+    }
+
+    void updateModulation() noexcept
+    {
+        if (spec_.sampleRate <= 0) return;
+        for (int i = 0; i < kFDNSize; ++i)
+        {
+            modLFOA_[i].setRate(modRate_ * (T(0.7) + T(0.05) * static_cast<T>(i)),
+                                spec_.sampleRate);
+            modLFOB_[i].setRate(modRate_ * (T(1.8) + T(0.11) * static_cast<T>(i)),
+                                spec_.sampleRate);
+        }
+        // Noise depth: 40% of LFO depth (breaks periodic patterns)
+        noiseDepth_ = modDepthA_.load(std::memory_order_relaxed) * T(0.4);
+    }
+
+    // --- Early reflection generation -----------------------------------------
+
+    void generateERTaps(double minMs, double maxMs, int numTaps) noexcept
+    {
+        numERTaps_ = std::min(numTaps, kMaxERTaps);
+        if (numERTaps_ <= 0) return;
+
+        double sr = spec_.sampleRate;
+        double ratio = (maxMs > minMs) ? maxMs / minMs : 1.0;
+        double sqrtN = std::sqrt(static_cast<double>(numERTaps_));
+
+        for (int t = 0; t < numERTaps_; ++t)
+        {
+            double frac = (numERTaps_ > 1)
+                ? static_cast<double>(t) / static_cast<double>(numERTaps_ - 1) : 0.0;
+
+            double msL = minMs * std::pow(ratio, frac);
+            erTapsL_[t] = std::max(1, static_cast<int>(msL * sr / 1000.0));
+
+            double jitter = 1.0 + 0.13 * std::sin(static_cast<double>(t) * 2.39996323);
+            double msR = msL * jitter;
+            msR = std::clamp(msR, minMs * 0.8, maxMs * 1.15);
+            erTapsR_[t] = std::max(1, static_cast<int>(msR * sr / 1000.0));
+
+            if (erTapsR_[t] == erTapsL_[t])
+                erTapsR_[t] = std::max(1, erTapsR_[t] + ((t & 1) ? 1 : -1));
+
+            double rawGain = std::pow(0.92, static_cast<double>(t));
+            erGainsL_[t] = static_cast<T>(rawGain / sqrtN);
+            erGainsR_[t] = static_cast<T>(rawGain / sqrtN * 0.95);
+        }
+
+        // Progressive frequency absorption: early taps bright, late taps dark
+        // Cutoff sweeps exponentially from 15kHz (tap 0) to 3kHz (last tap)
+        for (int t = 0; t < numERTaps_; ++t)
+        {
+            T f = static_cast<T>(t) / static_cast<T>(std::max(1, numERTaps_ - 1));
+            T cutoff = T(15000) * std::pow(T(3000) / T(15000), f);
+            erAbsCoeffs_[t] = T(1) - std::exp(T(-6.283185307179586) * cutoff
+                                               / static_cast<T>(sr));
+        }
+    }
+
+    static int nearestPrime(int n) noexcept
+    {
+        if (n <= 2) return 2;
+        if (n % 2 == 0) ++n;
+        while (true)
+        {
+            bool isPrime = true;
+            for (int d = 3; d * d <= n; d += 2)
+                if (n % d == 0) { isPrime = false; break; }
+            if (isPrime) return n;
+            n += 2;
+        }
+    }
+
+    // --- Preset application --------------------------------------------------
+
+    void applyPreset(Type type)
+    {
+        switch (type)
+        {
+            case Type::Room:
+                size_ = T(0.22); decayTime_ = T(0.5);
+                highDecayMult_ = T(0.40); bassDecayMult_ = T(1.1);
+                highCrossover_ = T(5000); bassCrossover_ = T(250);
+                diffusion_ = T(0.72); modDepth_ = T(0.14); modRate_ = T(1.2);
+                earlyLevel_.store(T(1), std::memory_order_relaxed); lateLevel_.store(T(0.8), std::memory_order_relaxed); erToLateMs_ = T(0);
+                toneLPActive_ = false; toneHPActive_ = false;
+                break;
+
+            case Type::Hall:
+                size_ = T(0.68); decayTime_ = T(2.2);
+                highDecayMult_ = T(0.32); bassDecayMult_ = T(1.3);
+                highCrossover_ = T(4500); bassCrossover_ = T(200);
+                diffusion_ = T(0.84); modDepth_ = T(0.22); modRate_ = T(0.55);
+                earlyLevel_.store(T(0.7), std::memory_order_relaxed); lateLevel_.store(T(1), std::memory_order_relaxed); erToLateMs_ = T(15);
+                toneLPActive_ = false; toneHPActive_ = false;
+                break;
+
+            case Type::Chamber:
+                size_ = T(0.38); decayTime_ = T(1.2);
+                highDecayMult_ = T(0.38); bassDecayMult_ = T(1.1);
+                highCrossover_ = T(5000); bassCrossover_ = T(250);
+                diffusion_ = T(0.78); modDepth_ = T(0.18); modRate_ = T(0.8);
+                earlyLevel_.store(T(0.9), std::memory_order_relaxed); lateLevel_.store(T(0.9), std::memory_order_relaxed); erToLateMs_ = T(8);
+                toneLPActive_ = false; toneHPActive_ = false;
+                break;
+
+            case Type::Plate:
+                size_ = T(0.14); decayTime_ = T(1.5);
+                highDecayMult_ = T(0.55); bassDecayMult_ = T(0.8);
+                highCrossover_ = T(7000); bassCrossover_ = T(150);
+                diffusion_ = T(0.94); modDepth_ = T(0.32); modRate_ = T(1.4);
+                earlyLevel_.store(T(0), std::memory_order_relaxed); lateLevel_.store(T(1), std::memory_order_relaxed); erToLateMs_ = T(0);
+                numERTaps_ = 0;
+                toneLPActive_ = false; toneHPActive_ = false;
+                break;
+
+            case Type::Spring:
+                size_ = T(0.11); decayTime_ = T(0.9);
+                highDecayMult_ = T(0.28); bassDecayMult_ = T(1.0);
+                highCrossover_ = T(4000); bassCrossover_ = T(200);
+                diffusion_ = T(0.38); modDepth_ = T(0.08); modRate_ = T(0.35);
+                earlyLevel_.store(T(0.5), std::memory_order_relaxed); lateLevel_.store(T(1), std::memory_order_relaxed); erToLateMs_ = T(0);
+                toneLPActive_ = false; toneHPActive_ = false;
+                break;
+
+            case Type::Cathedral:
+                size_ = T(0.98); decayTime_ = T(5.0);
+                highDecayMult_ = T(0.24); bassDecayMult_ = T(1.5);
+                highCrossover_ = T(3500); bassCrossover_ = T(150);
+                diffusion_ = T(0.91); modDepth_ = T(0.18); modRate_ = T(0.35);
+                earlyLevel_.store(T(0.5), std::memory_order_relaxed); lateLevel_.store(T(1), std::memory_order_relaxed); erToLateMs_ = T(25);
+                toneLPActive_ = false; toneHPActive_ = false;
+                break;
+        }
+
+        // Sync damping_ from highDecayMult_
+        damping_ = (T(1) - highDecayMult_) / T(0.9);
+        damping_ = std::clamp(damping_, T(0), T(1));
+
+        updateDiffCoeffs();
+        modDepthA_.store(modDepth_ * T(30), std::memory_order_relaxed);
+        modDepthB_.store(modDepth_ * T(15), std::memory_order_relaxed);
+
+        if (spec_.sampleRate > 0)
+        {
+            updateDelayLengths(); // also calls updateDecayParams()
+            updateModulation();
+
+            erToLateSamples_.store(static_cast<int>(
+                static_cast<T>(spec_.sampleRate) * erToLateMs_ / T(1000)),
+                std::memory_order_relaxed);
+
+            for (int i = 0; i < kFDNSize; ++i)
+            {
+                modLFOA_[i].prepare(spec_.sampleRate,
+                    modRate_ * (T(0.7) + T(0.05) * static_cast<T>(i)),
+                    static_cast<uint32_t>(i * 7919 + 1));
+                modLFOB_[i].prepare(spec_.sampleRate,
+                    modRate_ * (T(1.8) + T(0.11) * static_cast<T>(i)),
+                    static_cast<uint32_t>(i * 6271 + 31337));
+            }
+
+            switch (type)
+            {
+                case Type::Room:      generateERTaps(1.5, 35.0, 30);   break;
+                case Type::Hall:      generateERTaps(5.0, 110.0, 40);  break;
+                case Type::Chamber:   generateERTaps(3.0, 60.0, 35);   break;
+                case Type::Plate:     break;
+                case Type::Spring:    generateERTaps(1.0, 25.0, 15);   break;
+                case Type::Cathedral: generateERTaps(10.0, 160.0, 40); break;
+            }
+        }
+    }
+};
+
+} // namespace dspark
